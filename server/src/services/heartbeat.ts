@@ -1,3 +1,4 @@
+import { mergeRunRuntimeServicesIntoSnapshot } from "./run-context-snapshot.js";
 import { AGENT_CHAT_DIRECTIVE, conversationReplay, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
@@ -24249,17 +24250,21 @@ export function heartbeatService(
             ...adapterManagedRuntimeServices,
           ];
           context.paperclipRuntimeServices = combinedRuntimeServices;
-          context.paperclipRuntimePrimaryUrl =
+          const runtimePrimaryUrl =
             combinedRuntimeServices.find((service) =>
               readNonEmptyString(service.url),
             )?.url ?? null;
-          await db
-            .update(heartbeatRuns)
-            .set({
-              contextSnapshot: context,
-              updatedAt: new Date(),
-            })
-            .where(eq(heartbeatRuns.id, run.id));
+          context.paperclipRuntimePrimaryUrl = runtimePrimaryUrl;
+          // Merge only the runtime-service fields this writer owns. The
+          // in-memory `context` was read before dispatch, so writing it back
+          // wholesale would erase an issue anchor the checkout route bound
+          // into the persisted snapshot mid-run (and re-open the
+          // taskless-write wall).
+          await mergeRunRuntimeServicesIntoSnapshot(db, {
+            runId: run.id,
+            runtimeServices: combinedRuntimeServices,
+            primaryUrl: runtimePrimaryUrl,
+          });
           if (issueId) {
             try {
               await postWorkspaceReadyComment({

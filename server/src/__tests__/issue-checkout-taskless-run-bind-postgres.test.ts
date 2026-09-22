@@ -17,6 +17,7 @@ import {
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { mergeRunRuntimeServicesIntoSnapshot } from "../services/run-context-snapshot.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -219,6 +220,52 @@ describeEmbeddedPostgres(
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, runId));
       expect(run.contextSnapshot).toMatchObject({ issueId: sourceIssueId });
+    }, 30_000);
+
+    it("keeps the checkout anchor when adapter completion persists runtime services", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent("RTB");
+      const issueId = await seedIssue(companyId, "RTB", agentId);
+      const runId = await seedTasklessRun(companyId, agentId);
+      const client = app(agentActor(companyId, agentId, runId));
+
+      const checkout = await request(client)
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId, expectedStatuses: ["in_progress"] });
+      expect(checkout.status, JSON.stringify(checkout.body)).toBe(200);
+
+      // The adapter returns runtime services at completion. That writer owns
+      // only `paperclipRuntimeServices` / `paperclipRuntimePrimaryUrl`; every
+      // other field, including the checkout anchor, must survive its write.
+      // A wholesale write of the pre-dispatch in-memory context would drop the
+      // anchor, re-open the taskless-write wall, and allow a later checkout to
+      // rebind the run to a different source.
+      await mergeRunRuntimeServicesIntoSnapshot(db, {
+        runId,
+        runtimeServices: [
+          { name: "web", url: "http://runtime.example.test:4310", status: "running" },
+        ],
+        primaryUrl: "http://runtime.example.test:4310",
+      });
+
+      const [run] = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId));
+      expect(run.contextSnapshot).toMatchObject({
+        issueId,
+        source: "timer",
+        paperclipRuntimeServices: [
+          { name: "web", url: "http://runtime.example.test:4310", status: "running" },
+        ],
+        paperclipRuntimePrimaryUrl: "http://runtime.example.test:4310",
+      });
+
+      // The gate consequence: the same-issue write the run needs to record its
+      // disposition still passes after adapter completion.
+      const comment = await request(client)
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "disposition recorded after adapter completion" });
+      expect(comment.status, JSON.stringify(comment.body)).toBe(201);
     }, 30_000);
   },
 );
