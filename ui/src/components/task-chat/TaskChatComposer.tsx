@@ -71,6 +71,8 @@ import type { MentionOption } from "@/components/MarkdownEditor";
 import type { IssueAttachment, IssueWorkMode } from "@paperclipai/shared";
 import type { RunnerGoalCapability } from "@paperclipai/shared";
 import type { ActionCommandOption } from "@/context/EditorAutocompleteContext";
+import { useOptionalToastActions } from "@/context/ToastContext";
+import { randomUuidOrFallback } from "@/lib/random-uuid";
 import { TaskChatComposerTakeoverActionsContext } from "./TaskChatComposerTakeoverContext";
 
 import { TaskChatPausedTakeover, type TaskComposerPause } from "./TaskChatPausedTakeover";
@@ -417,6 +419,7 @@ export function TaskChatComposer({
 }: TaskChatComposerProps) {
   const streamlined = useStreamlinedTaskChatPresentation();
   const stopControl = useComposerStop(onStop, stopPending);
+  const toastActions = useOptionalToastActions();
   const [body, setBody] = useState(() => (draftKey ? loadDraft(draftKey) : ""));
   const [submitting, setSubmitting] = useState(false);
   const [reviewError, setReviewError] = useState(false);
@@ -664,7 +667,7 @@ export function TaskChatComposer({
 
   /** Upload an image and return its URL for inline `![](src)` markdown. */
   async function uploadInlineImage(file: File): Promise<string> {
-    const id = crypto.randomUUID();
+    const id = randomUuidOrFallback();
     setAttachments((prev) => [
       ...prev,
       {
@@ -981,7 +984,7 @@ export function TaskChatComposer({
         setBody(submittedBody);
         return;
       }
-      attemptId = crypto.randomUUID();
+      attemptId = randomUuidOrFallback();
       if (draftKey) {
         saveDraft(draftKey, submittedBody);
         saveDraftSubmission(draftKey, { attemptId, reviewed: false });
@@ -1045,6 +1048,20 @@ export function TaskChatComposer({
       }
       if (draftKey) saveDraft(draftKey, restoredBody, attemptId ?? undefined);
       setBody(restoredBody);
+      // The Board mutation owns durable error handling once the send is
+      // dispatched. An error that reaches here before dispatch (or a mutation
+      // rejection) would otherwise leave the composer silently restored with
+      // no sign that the message never sent.
+      if (!(error instanceof CommentSubmissionUnknownError)) {
+        toastActions?.pushToast({
+          title: "Message not sent",
+          body:
+            error instanceof Error
+              ? error.message
+              : "The message could not be sent. It was restored to the composer.",
+          tone: "error",
+        });
+      }
     } finally {
       if (pendingDraftRef.current?.attemptId === attemptId) pendingDraftRef.current = null;
       setSubmitting(false);
