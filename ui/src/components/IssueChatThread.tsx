@@ -5015,6 +5015,7 @@ const IssueChatComposer = forwardRef<
     bodyRef.current = "";
     setBody("");
     let attemptId: string | null = null;
+    let dispatched = false;
     try {
       if (workModeChanged && onWorkModeChange) {
         await onWorkModeChange(pendingWorkMode);
@@ -5033,7 +5034,9 @@ const IssueChatComposer = forwardRef<
         changeBody(bodyRef.current);
       }
       // assistant-ui thread.append is fire-and-forget. Await the actual Board
-      // mutation; it already owns optimistic echo and durable error handling.
+      // mutation; it already owns optimistic echo and durable error handling,
+      // including the error toast once the send is dispatched.
+      dispatched = true;
       const sendPromise = onSend(
         submittedBody, reopen, reassignment,
         attachmentIds.length ? attachmentIds : undefined, attemptId,
@@ -5066,11 +5069,11 @@ const IssueChatComposer = forwardRef<
       const restoredBody = nextDraft ? `${trimmed}\n\n${nextDraft}` : trimmed;
       if (draftKey) saveDraft(draftKey, restoredBody, attemptId ?? undefined);
       setBody(restoredBody);
-      // The Board mutation owns durable error handling once the send is
-      // dispatched. An error that reaches here before dispatch (or a mutation
-      // rejection) would otherwise leave the composer silently restored with
-      // no sign that the message never sent.
-      if (!(error instanceof CommentSubmissionUnknownError)) {
+      // The Board mutation owns durable error handling, including its error
+      // toast, once the send is dispatched. Only errors before dispatch (for
+      // example the attempt-id failure this guards against) would otherwise
+      // leave the composer silently restored with no sign nothing was sent.
+      if (!dispatched && !(error instanceof CommentSubmissionUnknownError)) {
         toastActions?.pushToast({
           title: "Message not sent",
           body:
