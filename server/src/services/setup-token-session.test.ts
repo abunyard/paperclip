@@ -682,6 +682,34 @@ describe("SetupTokenSessionService durable reaper", () => {
     expect(summary.failed).toBe(1);
     expect(store.rows.has("orphan-2")).toBe(true);
   });
+
+  it("clears a terminal record with no provider lease without attempting a release", async () => {
+    const store = new FakeStore();
+    // A session that ended before ever binding a provider lease leaves
+    // provider_lease_id null, which the record maps to an empty lease id.
+    await store.record({
+      sessionId: "orphan-3",
+      companyId: "company-1",
+      ownerUserId: "user-1",
+      adapterType: "claude_local",
+      environmentId: "env-1",
+      leaseId: "",
+      deadline: 1_000,
+      state: "timed_out",
+      boundAt: null,
+    });
+    const leases = new FakeLeaseManager();
+    // Prove the empty-lease record is cleared without ever reaching the lease
+    // manager: any release attempt would throw and strand the row forever.
+    leases.releaseById = async () => {
+      throw new Error("releaseById must not be called for an empty lease id");
+    };
+    const { service } = buildService({ store, leases, now: () => 5_000 });
+    const summary = await service.reap(5_000);
+    expect(summary.released).toBe(1);
+    expect(leases.releaseByIdCalls).toEqual([]);
+    expect(store.rows.size).toBe(0);
+  });
 });
 
 describe("SetupTokenSessionService.cancelByScope", () => {

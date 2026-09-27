@@ -335,7 +335,12 @@ export async function reapSetupTokenLeases(
   let failed = 0;
   for (const record of records) {
     try {
-      await deps.leases.releaseById(record.leaseId);
+      // A session that never bound a provider lease has no sandbox to tear
+      // down. Its lease id is the empty fallback, and releasing it would throw,
+      // leaving the durable row to be reaped again forever. Clear it directly.
+      if (record.leaseId) {
+        await deps.leases.releaseById(record.leaseId);
+      }
       await deps.store.remove({
         sessionId: record.sessionId,
         companyId: record.companyId,
