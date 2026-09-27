@@ -24,6 +24,7 @@ import {
   SETUP_TOKEN_TOKEN_UNAVAILABLE,
   SETUP_TOKEN_STORAGE_FAILED,
   SETUP_TOKEN_CANCELLABLE_STATES,
+  reapSetupTokenLeases,
   type SetupTokenCleanupIdentity,
   type SetupTokenCleanupRecord,
   type SetupTokenCleanupStore,
@@ -1592,6 +1593,47 @@ describeEmbeddedPostgres("durable setup-token cleanup store (embedded postgres)"
     expect(ids.has(consumed.sessionId)).toBe(true);
     // A live, unexpired, unconsumed stored claim is not reapable.
     expect(ids.has(liveStored.sessionId)).toBe(false);
+  });
+
+  it("does not list a local terminal sign-in row, so its own reaper keeps the cleanup", async () => {
+    const store = createDbSetupTokenCleanupStore(db);
+    const now = Date.now();
+
+    // A genuine setup-token row: no connection method, terminal, past deadline.
+    const setupToken = await seedScope();
+    await insertRecord(setupToken, "timed_out", now - 1_000);
+
+    // A local terminal sign-in row. It shares the adapter type and is expired,
+    // so the terminal and deadline branches would otherwise match it, but it
+    // carries a connection method and owns an on-disk home. The store writes no
+    // connection method, so this row is inserted directly.
+    const localSignIn = await seedScope();
+    await db.insert(adapterAuthSessions).values({
+      id: randomUUID(),
+      publicSessionId: localSignIn.sessionId,
+      companyId: localSignIn.companyId,
+      environmentId: localSignIn.environmentId,
+      adapterType: localSignIn.adapterType,
+      startedByUserId: localSignIn.ownerUserId,
+      connectionMethod: "local_subscription",
+      status: "timed_out",
+      expiresAt: new Date(now - 1_000),
+    });
+
+    const reapable = await store.listReapable(now);
+    const ids = new Set(reapable.map((record) => record.sessionId));
+    expect(ids.has(setupToken.sessionId)).toBe(true);
+    // The local sign-in row must stay out of the scan: deleting it here would
+    // remove the row id its own reaper uses to find the sign-in home.
+    expect(ids.has(localSignIn.sessionId)).toBe(false);
+
+    // The reaper over this store also leaves the row in place, so the sweep that
+    // clears the setup-token row does not touch the local sign-in row.
+    const leases = new FakeLeaseManager();
+    const summary = await reapSetupTokenLeases({ store, leases }, now);
+    expect(summary.released).toBe(1);
+    expect(await readRow(localSignIn.sessionId)).toBeDefined();
+    expect(await readRow(setupToken.sessionId)).toBeUndefined();
   });
 
   it("returns no row when the claim row lock holds until after the deadline", async () => {
