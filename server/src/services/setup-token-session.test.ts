@@ -710,6 +710,48 @@ describe("SetupTokenSessionService durable reaper", () => {
     expect(leases.releaseByIdCalls).toEqual([]);
     expect(store.rows.size).toBe(0);
   });
+
+  it("leaves a local terminal sign-in row for its own reaper instead of deleting it", async () => {
+    const store = new FakeStore();
+    // A local Anthropic sign-in shares the claude_local adapter but carries a
+    // connection method and owns an on-disk home. The setup-token reaper must
+    // not delete it, or the local-login reaper loses the row it needs to find
+    // and remove that home.
+    await store.record({
+      sessionId: "local-subscription-1",
+      companyId: "company-1",
+      ownerUserId: "user-1",
+      adapterType: "claude_local",
+      environmentId: "env-1",
+      leaseId: "",
+      deadline: 1_000,
+      state: "timed_out",
+      connectionMethod: "local_subscription",
+      boundAt: null,
+    });
+    // A genuine setup-token row with no lease, cleared in the same sweep.
+    await store.record({
+      sessionId: "setup-token-1",
+      companyId: "company-1",
+      ownerUserId: "user-1",
+      adapterType: "claude_local",
+      environmentId: "env-1",
+      leaseId: "",
+      deadline: 1_000,
+      state: "timed_out",
+      boundAt: null,
+    });
+    const leases = new FakeLeaseManager();
+    leases.releaseById = async () => {
+      throw new Error("releaseById must not be called for an empty lease id");
+    };
+    const { service } = buildService({ store, leases, now: () => 5_000 });
+    const summary = await service.reap(5_000);
+    expect(summary.released).toBe(1);
+    expect(leases.releaseByIdCalls).toEqual([]);
+    expect(store.rows.has("local-subscription-1")).toBe(true);
+    expect(store.rows.has("setup-token-1")).toBe(false);
+  });
 });
 
 describe("SetupTokenSessionService.cancelByScope", () => {
