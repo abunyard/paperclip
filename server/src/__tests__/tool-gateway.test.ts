@@ -1681,6 +1681,73 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
     });
   });
 
+  // wabnet L0005: agent calls to local stdio tools default to the 60s gateway max, not the 10s default.
+  const slowLocalStdioScript = `
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "slow-stdio", version: "0.0.0" } } }) + "\\n");
+    return;
+  }
+  if (message.method === "tools/call") {
+    const delayMs = Number(message.params?.arguments?.message ?? "0");
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: "slow:" + delayMs }] } }) + "\\n");
+    }, delayMs);
+  }
+});
+`;
+
+  async function slowLocalStdioSession() {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const localTool = await createLocalStdioMcpTool(db, company.id, {
+      applicationKey: `local-slow-${randomUUID().slice(0, 8)}`,
+      connectionName: "Local Slow",
+      toolName: "slow",
+      title: "Local slow",
+      stdioScript: slowLocalStdioScript,
+    });
+    const profile = await allowToolsForAgent(db, company.id, agent.id, []);
+    await db.insert(toolProfileEntries).values({
+      companyId: company.id,
+      profileId: profile.id,
+      selectorType: "catalog_entry",
+      effect: "include",
+      catalogEntryId: localTool.catalogEntry.id,
+    });
+    const gateway = createTestToolGatewayService(db, { runtimeSupervisor: { idleTtlMs: 10_000 } });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const name = expectedConnectedToolName({ applicationKey: localTool.application.applicationKey, connectionId: localTool.connection.id, toolName: "slow" });
+    return { gateway, session, name };
+  }
+
+  it("gives agent local stdio calls without a caller timeout more than the 10s default", async () => {
+    const { gateway, session, name } = await slowLocalStdioSession();
+    // 11.5s is past DEFAULT_TOOL_TIMEOUT_MS (10s), so this call timed out before L0005.
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: name,
+      parameters: { message: "11500" },
+    })).resolves.toMatchObject({ status: "completed", result: { content: "slow:11500" } });
+  }, 45_000);
+
+  it("still honors an explicit caller timeout on agent local stdio calls", async () => {
+    const { gateway, session, name } = await slowLocalStdioSession();
+    await gateway.executeTool({
+      sessionToken: session.token,
+      tool: name,
+      parameters: { message: "3000" },
+      timeoutMs: 500,
+    }).then(
+      () => { throw new Error("Expected the local stdio call to time out"); },
+      (error) => expectGatewayError(error, 504, "tool_timeout"),
+    );
+  }, 45_000);
+
   it("passes only approved env values to local stdio MCP processes", async () => {
     const previousDatabaseUrl = process.env.DATABASE_URL;
     process.env.DATABASE_URL = "postgres://server-secret.example/paperclip";

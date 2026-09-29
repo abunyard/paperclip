@@ -149,6 +149,8 @@ import { extendApprovedExecutionWaitDeadline } from "./approved-execution-wait.j
 const DEFAULT_SESSION_TTL_MS = 15 * 60 * 1000;
 const MAX_SESSION_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_TOOL_TIMEOUT_MS = 10_000;
+// wabnet L0005: default for agent calls to local stdio MCP tools (capped at 60s by timeoutMs()).
+const AGENT_LOCAL_STDIO_TOOL_TIMEOUT_MS = 60_000;
 
 export function resolveCredentialGrantKind(
   policy: "shared" | "per_user" | "per_user_with_fallback" | "per_agent",
@@ -10218,7 +10220,12 @@ export function createToolGatewayService(
                   session,
                   tool,
                   effectiveParameters,
-                  executionTimeoutMs,
+                  // wabnet L0005: an agent stdio call without a caller timeout gets the gateway max
+                  // (60s) instead of DEFAULT_TOOL_TIMEOUT_MS (10s). Slow local tools (for example image
+                  // generation, ~25s) otherwise always time out. An explicit caller timeout still wins.
+                  session.agentId && !Number.isFinite(input.timeoutMs)
+                    ? timeoutMs(AGENT_LOCAL_STDIO_TOOL_TIMEOUT_MS)
+                    : executionTimeoutMs,
                 )
               : null;
         const result = connectedMcpExecution
