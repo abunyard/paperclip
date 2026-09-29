@@ -108,8 +108,23 @@ function json(response, status, value) {
   response.end(JSON.stringify(value));
 }
 
+// Each simulated turn reuses the same short event ids ("event-1",
+// "event-3", and so on). OpenCode's real event ids are unique, and the
+// driver relies on that to drop a duplicate delivery of the same event.
+// Scope every event id to the turn that produced it so a second turn's
+// events do not look like duplicates of the first turn's events.
+let promptTurnSeq = 0;
+// Set by a "late-straggler-source" turn to simulate a distinct provider
+// frame for that turn's message arriving only after the next turn's prompt
+// has already been accepted. Flushed at the very start of the next prompt
+// request, after the driver has already moved its active turn forward.
+let lateStragglerPending = false;
 function emit(value) {
-  const frame = `data: ${JSON.stringify(value)}\n\n`;
+  const scoped =
+    promptTurnSeq > 0 && typeof value.id === "string"
+      ? { ...value, id: `${value.id}#${promptTurnSeq}` }
+      : value;
+  const frame = `data: ${JSON.stringify(scoped)}\n\n`;
   for (const response of clients) response.write(frame);
 }
 
@@ -381,7 +396,25 @@ const server = createServer(async (request, response) => {
           error: "OpenCode 1.18 prompt model fields must be top-level",
         });
       }
+      promptTurnSeq += 1;
       json(response, 204, null);
+      if (lateStragglerPending) {
+        lateStragglerPending = false;
+        emit({
+          type: "message.part.updated",
+          id: "event-late-straggler-delivery",
+          properties: {
+            sessionID: session.id,
+            part: {
+              id: "part-late-straggler",
+              messageID: "message-late-source",
+              type: "text",
+              text: "late straggler text must not reach the next turn",
+              time: { start: 9, end: 10 },
+            },
+          },
+        });
+      }
       setTimeout(async () => {
         await callFirstPaperclipTool();
         const parsedPrompt = parsedPromptText(promptPayload);
@@ -428,6 +461,73 @@ const server = createServer(async (request, response) => {
               },
             },
           });
+          return;
+        }
+        if (String(parsedPrompt.message ?? "").includes("session-failed")) {
+          emit({
+            type: "session.error",
+            id: "event-session-failed",
+            properties: {
+              sessionID: session.id,
+              error: {
+                name: "ProviderError",
+                message: "The fake provider failed on purpose.",
+              },
+            },
+          });
+          return;
+        }
+        if (
+          String(parsedPrompt.message ?? "").includes("late-straggler-source")
+        ) {
+          emit({
+            type: "message.updated",
+            id: "event-late-source-message",
+            properties: {
+              sessionID: session.id,
+              info: {
+                id: "message-late-source",
+                sessionID: session.id,
+                role: "assistant",
+              },
+            },
+          });
+          await callTerminalTool(promptPayload);
+          emit({
+            type: "message.part.updated",
+            id: "event-late-source-part",
+            properties: {
+              sessionID: session.id,
+              part: {
+                id: "part-late-source",
+                messageID: "message-late-source",
+                type: "text",
+                text: "done",
+                time: { start: 1, end: 2 },
+              },
+            },
+          });
+          emit({
+            type: "message.updated",
+            id: "event-late-source-usage",
+            properties: {
+              info: {
+                id: "message-late-source",
+                sessionID: session.id,
+                role: "assistant",
+                tokens: { input: 3, output: 2 },
+                cost: 0.001,
+              },
+            },
+          });
+          emit({
+            type: "session.idle",
+            id: "event-late-source-idle",
+            properties: { sessionID: session.id },
+          });
+          // Deliver the straggling frame for this message only once the
+          // next turn's own prompt has already been accepted.
+          lateStragglerPending = true;
           return;
         }
         const textBeforeFinish = String(parsedPrompt.message ?? "").includes(

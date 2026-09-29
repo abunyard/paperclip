@@ -383,7 +383,18 @@ class OpenCodeHarnessSession implements HarnessSession {
   readonly #events = new AsyncQueue<PrpEvent>();
   readonly #transcript: PrpEvent[] = [];
   readonly #terminalTurns = new Map<string, string>();
+  // Turns whose terminal event has already reached the queue. Unlike
+  // `#terminalTurns`, `attachRun` never clears this set: a turn id is never
+  // reused, so a late provider frame for a sealed turn must stay blocked for
+  // the rest of the session, even after a new turn attaches.
+  readonly #sealedTurnIds = new Set<string>();
   readonly #seenProviderEvents = new Set<string>();
+  // The turn that created each native message. A raw OpenCode frame carries
+  // no turn identity of its own, so this map — not the mutable active-turn
+  // pointer, which can already have moved on to a later turn by the time a
+  // straggling frame for this message arrives — is the source of truth for
+  // which turn a message's content belongs to.
+  readonly #messageTurnIds = new Map<string, string>();
   readonly #messageRoles = new Map<string, string>();
   readonly #pendingMessageParts = new Map<
     string,
@@ -467,8 +478,10 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#resultFingerprint = restored?.fingerprint ?? null;
     this.#resultCallId = restored?.callId ?? null;
     this.#resultTurnId = restored?.turnId ?? null;
-    for (const terminal of input.snapshot?.terminalTurns ?? [])
+    for (const terminal of input.snapshot?.terminalTurns ?? []) {
       this.#terminalTurns.set(terminal.turnId, terminal.fingerprint);
+      this.#sealedTurnIds.add(terminal.turnId);
+    }
     if (this.#activeTurnId && this.#terminalTurns.has(this.#activeTurnId)) {
       this.#activeTurnId = null;
     }
@@ -523,6 +536,10 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#completedTextPartIds.clear();
     this.#completedReasoningPartIds.clear();
     this.#completedTextParts.length = 0;
+    // `#terminalTurns` clears here for its own persisted-snapshot bookkeeping.
+    // `#sealedTurnIds` does not clear: it is the event-queue gate, and a turn
+    // id is never reused, so a late frame for the just-finished turn must
+    // stay blocked even after this new run attaches.
     this.#terminalTurns.clear();
     this.#sendFullContext = false;
     this.#emit("run.attached", { runId: input.runId, sameSession: true });
@@ -1375,7 +1392,7 @@ class OpenCodeHarnessSession implements HarnessSession {
         "runtime_request.resolved",
         harnessRuntimeRequestOutcome(pending.request, { action }),
         {
-          turnId,
+          turnId: pending.request.turnId,
           itemId: pending.request.itemId,
         },
       );
@@ -1402,16 +1419,21 @@ class OpenCodeHarnessSession implements HarnessSession {
             ? { action: "submit", response: pending.submittedResponse }
             : { reason: "provider_rejected" },
         ),
-        { turnId, itemId: pending.request.itemId },
+        { turnId: pending.request.turnId, itemId: pending.request.itemId },
       );
       return;
     }
-    if (type === "message.part.updated" && turnId) {
+    if (type === "message.part.updated") {
       const part = record(properties.part);
       const messageId = text(part.messageID, text(part.messageId));
       if (!messageId) return;
+      // Resolve the turn this message actually belongs to, not whichever
+      // turn is active right now. A straggling part for an earlier message
+      // must stay attributed to the turn that created that message.
+      const owningTurnId = this.#messageTurnIds.get(messageId) ?? turnId;
+      if (!owningTurnId) return;
       const role = this.#messageRoles.get(messageId);
-      if (role === "assistant") this.#emitAssistantPart(part, turnId);
+      if (role === "assistant") this.#emitAssistantPart(part, owningTurnId);
       else if (role === undefined) {
         const pending = this.#pendingMessageParts.get(messageId) ?? [];
         if (pending.length < 100) pending.push(part);
@@ -1419,19 +1441,29 @@ class OpenCodeHarnessSession implements HarnessSession {
       }
       return;
     }
-    if (type === "message.updated" && turnId) {
+    if (type === "message.updated") {
       const info = record(properties.info);
       const messageId = text(
         info.id,
         text(info.messageID, text(info.messageId)),
       );
       const role = text(info.role);
+      // Record the message's owning turn at the moment OpenCode first
+      // reports it. A later turn that reuses the same native message id
+      // legitimately reclaims ownership; a stale message never sees this
+      // branch again, so its recorded owner never changes.
+      if (messageId && role && turnId) this.#messageTurnIds.set(messageId, turnId);
+      const owningTurnId = messageId
+        ? (this.#messageTurnIds.get(messageId) ?? turnId)
+        : turnId;
+      if (!owningTurnId) return;
       if (messageId && role) {
         this.#messageRoles.set(messageId, role);
         const pending = this.#pendingMessageParts.get(messageId) ?? [];
         this.#pendingMessageParts.delete(messageId);
         if (role === "assistant")
-          for (const part of pending) this.#emitAssistantPart(part, turnId);
+          for (const part of pending)
+            this.#emitAssistantPart(part, owningTurnId);
       }
       const tokens = record(info.tokens);
       if (
@@ -1457,7 +1489,7 @@ class OpenCodeHarnessSession implements HarnessSession {
           this.#emit(
             "item.completed",
             { kind: "usage", usage: this.#usage, usageMessageId: messageId },
-            { turnId, itemId: `${turnId}:usage` },
+            { turnId: owningTurnId, itemId: `${owningTurnId}:usage` },
           );
         }
       }
@@ -1484,7 +1516,9 @@ class OpenCodeHarnessSession implements HarnessSession {
         );
       this.#activeTurnId = null;
       this.#emit("turn.completed", { status: "completed" }, { turnId });
-      this.#events.close();
+      // Seal only after the terminal event itself has gone through the gate
+      // in `#emit`; sealing first would make `#emit` drop this very event.
+      this.#sealedTurnIds.add(turnId);
       return;
     }
     if (type === "session.error" && turnId) {
@@ -1512,7 +1546,7 @@ class OpenCodeHarnessSession implements HarnessSession {
           { turnId },
         );
         this.#terminalTurns.set(turnId, canonicalJson({ status: "cancelled" }));
-        this.#events.close();
+        this.#sealedTurnIds.add(turnId);
         return;
       }
       this.#emit(
@@ -1539,7 +1573,7 @@ class OpenCodeHarnessSession implements HarnessSession {
         { turnId },
       );
       this.#terminalTurns.set(turnId, canonicalJson({ status: "failed" }));
-      this.#events.close();
+      this.#sealedTurnIds.add(turnId);
     }
   }
 
@@ -1804,6 +1838,23 @@ class OpenCodeHarnessSession implements HarnessSession {
     payload: Record<string, unknown>,
     refs: { turnId?: string; itemId?: string } = {},
   ): void {
+    if (
+      eventType !== "harness.diagnostic" &&
+      refs.turnId !== undefined &&
+      this.#sealedTurnIds.has(refs.turnId)
+    ) {
+      // The provider sent this frame after its turn already reached a
+      // terminal state. The queue now stays open across turns, so a silent
+      // drop here would let a stale frame reach the next turn's consumer.
+      // Report it instead of discarding it without a trace.
+      this.#emit("harness.diagnostic", {
+        code: "opencode_late_terminal_turn_event_dropped",
+        message: `OpenCode sent a ${eventType} event for a turn that already reached a terminal state.`,
+        droppedEventType: eventType,
+        turnId: refs.turnId,
+      });
+      return;
+    }
     const sourceSeq = ++this.#sourceSequence;
     const event: PrpEvent = {
       schema: "paperclip.prp.event.v1",
