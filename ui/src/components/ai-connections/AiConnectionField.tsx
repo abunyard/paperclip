@@ -11,6 +11,7 @@ import { aiConnectionsApi } from "@/api/ai-connections";
 import { AiConnectionPicker } from "./AiConnectionPicker";
 import { AiConnectionLegacyNotice } from "./AiConnectionManagement";
 import { AiConnectionCredentialStep } from "./AiConnectionCredentialStep";
+import { AnthropicCompatibleEndpointChooser } from "./AnthropicCompatibleEndpointChooser";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -56,7 +57,10 @@ export function AiConnectionField({
   legacy?: boolean;
   readOnly?: boolean;
 }) {
-  const provider = aiProviderForAdapter(adapterType);
+  const adapterProvider = aiProviderForAdapter(adapterType);
+  // wabnet fork: a claude_local agent can run on Claude or on an Anthropic-compatible endpoint.
+  const [useEndpoint, setUseEndpoint] = useState(value?.provider === "anthropic_compatible");
+  const provider: AiProvider | undefined = adapterProvider === "anthropic" && useEndpoint ? "anthropic_compatible" : adapterProvider;
   const returnFocus = useRef<HTMLElement | null>(null);
   const restoreFocus = (event: Event) => { event.preventDefault(); returnFocus.current?.focus(); };
   const [adopting, setAdopting] = useState(false);
@@ -91,7 +95,20 @@ export function AiConnectionField({
           a compatible connection before saving.
         </p>
       )}
-      <AiConnectionPicker
+      {adapterProvider === "anthropic" && !readOnly && (
+        <div className="flex flex-wrap gap-2" role="group" aria-label="Model provider">
+          <Button type="button" size="sm" variant={useEndpoint ? "outline" : "default"} aria-pressed={!useEndpoint} onClick={() => setUseEndpoint(false)}>Claude</Button>
+          <Button type="button" size="sm" variant={useEndpoint ? "default" : "outline"} aria-pressed={useEndpoint} onClick={() => setUseEndpoint(true)}>Anthropic-compatible endpoint</Button>
+        </div>
+      )}
+      {provider === "anthropic_compatible" ? (
+        <AnthropicCompatibleEndpointChooser
+          companyId={companyId}
+          agentId={agentId}
+          value={value?.provider === "anthropic_compatible" ? value : undefined}
+          onChange={(binding) => changeBinding(binding)}
+        />
+      ) : <AiConnectionPicker
         requirement={{ companyId, provider }}
         connections={accounts.data?.connections ?? []}
         value={value}
@@ -106,7 +123,7 @@ export function AiConnectionField({
         }
         onConnect={() => { returnFocus.current = document.activeElement as HTMLElement; setConnecting(true); }}
         onRetry={() => void accounts.refetch()}
-      />
+      />}
       <Dialog
         open={Boolean(pendingAdoption)}
         onOpenChange={(open) => {

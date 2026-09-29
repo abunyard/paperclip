@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type AiProvider, type AiAuthMethod, type AiConnectionLoginIntent } from "@paperclipai/shared";
 import { AgentProviderConnection } from "@/components/new-agent/AgentProviderConnection";
+import { AnthropicCompatibleEndpointForm } from "./AnthropicCompatibleEndpointForm";
 import { ProviderApiKeyCard } from "@/components/AdapterLoginChrome";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -30,6 +31,9 @@ type Props = {
 
 /** Connections hosts the same provider step as agent setup, with its own save intent. */
 export function AiConnectionCredentialStep(props: Props) {
+  // wabnet fork: an Anthropic-compatible endpoint is a key plus routing metadata.
+  if (props.provider === "anthropic_compatible")
+    return <AnthropicCompatibleEndpointForm companyId={props.companyId} agentIds={props.agentIds} ownership={props.ownership} onCancel={props.onCancel} onComplete={(result) => props.onComplete(result)} />;
   if (props.provider === "openrouter") return <ApiKeyConnectionStep {...props} />;
   return <SubscriptionConnectionStep {...props} />;
 }

@@ -23,6 +23,8 @@ export const AI_PROVIDERS: Record<
     subscriptionName: "Grok subscription",
     logo: "/brands/adapters/grok.svg",
   },
+  // wabnet fork: user-configured Anthropic Messages endpoint (MiniMax, Alibaba, gateways).
+  anthropic_compatible: { name: "Anthropic-compatible endpoint" },
 };
 
 export type AiConnectionSummary = Omit<AiManagedConnectionSummary, "isDefault"> & { isDefault?: boolean };

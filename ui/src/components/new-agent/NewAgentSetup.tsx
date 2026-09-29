@@ -50,6 +50,8 @@ import { ModelDropdown } from "../AgentConfigForm";
 import { Field } from "../agent-config-primitives";
 import { SecretPicker } from "../environment-variables-editor/SecretPicker";
 import { Button } from "../ui/button";
+import { aiConnectionsApi } from "@/api/ai-connections";
+import { AnthropicCompatibleEndpointChooser } from "../ai-connections/AnthropicCompatibleEndpointChooser";
 import { Input } from "../ui/input";
 import { PillGuy } from "../onboarding/PillGuy";
 import {
@@ -149,6 +151,8 @@ function Setup({
       : undefined,
   );
   const [connection, setConnection] = useState<ProviderConnection | null>(null);
+  // wabnet fork: claude_local may connect to an Anthropic-compatible endpoint instead of Claude.
+  const [endpointConnect, setEndpointConnect] = useState(false);
   const aiBinding = runtimeAiBinding ?? connection?.aiConnection;
   const [repository, setRepository] = useState("");
   const [branch, setBranch] = useState("");
@@ -210,12 +214,22 @@ function Setup({
     queryKey: queryKeys.environments.capabilities(companyId),
     queryFn: () => environmentsApi.capabilities(companyId),
   });
-  const models = useQuery({
+  const onEndpoint = aiBinding?.provider === "anthropic_compatible";
+  const adapterModelList = useQuery({
     queryKey: queryKeys.agents.adapterModels(companyId, brandType, null, aiBinding?.provider),
     queryFn: () => agentsApi.adapterModels(companyId, brandType, { provider: aiBinding?.provider }),
-    enabled: Boolean(brandType) && showModel,
+    enabled: Boolean(brandType) && showModel && !onEndpoint,
     retry: false,
   });
+  const endpointAccounts = useQuery({
+    queryKey: ["ai-connections", companyId, undefined],
+    queryFn: () => aiConnectionsApi.list(companyId),
+    enabled: onEndpoint,
+  });
+  const endpointModels = onEndpoint && aiBinding?.mode === "shared"
+    ? (endpointAccounts.data?.connections.find((c) => c.id === aiBinding.connectionId)?.endpoint?.models ?? []).map((id) => ({ id, label: id }))
+    : undefined;
+  const models = { ...adapterModelList, data: endpointModels ?? adapterModelList.data, error: onEndpoint ? null : adapterModelList.error };
   const companySecrets = useQuery({
     queryKey: queryKeys.secrets.list(companyId),
     queryFn: () => secretsApi.list(companyId),
@@ -714,6 +728,17 @@ function Setup({
                         center
                       />
                     </div>
+                    {connectionAdapter === "claude_local" && endpointConnect ? (
+                      <AnthropicCompatibleEndpointChooser
+                        companyId={companyId}
+                        onCancel={() => setEndpointConnect(false)}
+                        onChange={(binding) => {
+                          setConnection({ env: {}, aiConnection: binding });
+                          resetTest();
+                          setScreen("runtime");
+                        }}
+                      />
+                    ) : <>
                     <AgentProviderConnection
                       key={environmentId ?? "local"}
                       companyId={companyId}
@@ -742,6 +767,14 @@ function Setup({
                         setScreen("runtime");
                       }}
                     />
+                    {connectionAdapter === "claude_local" && (
+                      <div className="mt-4 text-center">
+                        <Button type="button" variant="link" onClick={() => setEndpointConnect(true)}>
+                          Use an Anthropic-compatible endpoint instead (MiniMax, Alibaba, a gateway)
+                        </Button>
+                      </div>
+                    )}
+                    </>}
                   </OnboardingCard>
                 ) : screen === "saved" && created ? (
                   <div className="space-y-6">
