@@ -1,6 +1,7 @@
 import { listOpenRouterModels } from "../services/openrouter-models.js";
 import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings } from "../services/ai-connection-runtime.js";
-import { ADAPTER_AUTH_MISSING_CHECK_CODE, AI_CONNECTION_CAPABILITIES, aiConnectionBindingSchema, anthropicCompatibleEndpointSchema, type AiConnectionBinding } from "@paperclipai/shared";
+import { ADAPTER_AUTH_MISSING_CHECK_CODE, AI_CONNECTION_CAPABILITIES, aiConnectionBindingSchema, type AiConnectionBinding } from "@paperclipai/shared";
+import { endpointFromConnectionConfig } from "../services/anthropic-compatible-endpoint.js";
 import { toolConnections } from "@paperclipai/db";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { defaultAiConnectionForHire } from "../services/agent-ai-connection-default.js";
@@ -3316,14 +3317,15 @@ export function agentRoutes(
       const key = envKey ? runtimeEnv[envKey] : undefined;
       try {
         if (typeof key !== "string" || !key) throw unprocessable("The selected account's API key was not available to verify.");
-        const endpoint = binding.provider === "anthropic_compatible"
-          ? anthropicCompatibleEndpointSchema.parse({
-              baseUrl: runtimeEnv.ANTHROPIC_BASE_URL,
-              authHeader: envKey === "ANTHROPIC_API_KEY" ? "x-api-key" : "bearer",
-              models: typeof runtimeEnv.ANTHROPIC_MODEL === "string" && runtimeEnv.ANTHROPIC_MODEL ? [runtimeEnv.ANTHROPIC_MODEL] : [],
-              billing: { biller: "verification" },
-            })
-          : undefined;
+        const managedConnectionId = (context.config as { managedAiConnection?: { connectionId?: string } }).managedAiConnection?.connectionId;
+        let endpoint: ReturnType<typeof endpointFromConnectionConfig> | undefined;
+        if (binding.provider === "anthropic_compatible") {
+          // Verify against the saved endpoint (its models), not a reconstruction from env.
+          const [connection] = managedConnectionId
+            ? await db.select({ config: toolConnections.config }).from(toolConnections).where(eq(toolConnections.id, managedConnectionId))
+            : [];
+          endpoint = endpointFromConnectionConfig(connection?.config);
+        }
         await validateAiApiKey(binding.provider, key, fetch, endpoint);
         result.checks.push({ code: "ai_connection_api_key_reverified", level: "info", message: "The provider verified this API key for adoption." });
       } catch (error) {
