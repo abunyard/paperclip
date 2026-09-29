@@ -885,6 +885,73 @@ describe("OpenCodeServerDriver", () => {
     await session.close({ reason: "test" });
   });
 
+  it("drops a distinct late frame for a completed turn instead of attributing it to the next turn", async () => {
+    await chmod(fixture, 0o755);
+    const root = await mkdtemp(
+      join(tmpdir(), "paperclip-opencode-late-frame-"),
+    );
+    const workspace = await mkdtemp(
+      join(tmpdir(), "paperclip-opencode-late-frame-workspace-"),
+    );
+    roots.push(root, workspace);
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: root,
+      command: fixture,
+      environment: {
+        PATH: process.env.PATH,
+        OPENROUTER_API_KEY: "fixture-key",
+      },
+    });
+    const session = await driver.openSession({
+      runId: "run-late-frame",
+      normalizedSessionId: "late-frame",
+      workingDirectory: workspace,
+    });
+
+    const firstTurn = await session.startTurn({
+      message: { role: "user", text: "late-straggler-source" },
+    });
+    const firstTurnEvents = await collectTurnEvents(session.events());
+    expect(
+      firstTurnEvents.filter((event) => event.eventType === "turn.completed"),
+    ).toMatchObject([{ turnId: firstTurn.turnId }]);
+
+    // The fixture holds a distinct frame for the first turn's message and
+    // delivers it only once this second turn's prompt has been accepted,
+    // simulating a provider frame that arrives after its own turn is
+    // already sealed.
+    const secondTurn = await session.startTurn({
+      message: { role: "user", text: "finish" },
+    });
+    expect(secondTurn.turnId).not.toBe(firstTurn.turnId);
+    const secondTurnEvents = await collectTurnEvents(session.events());
+
+    expect(
+      secondTurnEvents.some((event) =>
+        JSON.stringify(event.payload).includes(
+          "late straggler text must not reach the next turn",
+        ),
+      ),
+    ).toBe(false);
+    expect(
+      secondTurnEvents.some((event) => event.turnId === firstTurn.turnId),
+    ).toBe(false);
+    expect(
+      secondTurnEvents.filter((event) => event.eventType === "turn.completed"),
+    ).toMatchObject([{ turnId: secondTurn.turnId }]);
+    expect(
+      secondTurnEvents.find(
+        (event) => event.eventType === "harness.diagnostic",
+      )?.payload,
+    ).toMatchObject({
+      code: "opencode_late_terminal_turn_event_dropped",
+      turnId: firstTurn.turnId,
+    });
+
+    await session.close({ reason: "test" });
+  });
+
   it("keeps the session usable after a cancelled turn so the next turn on the same session still completes", async () => {
     await chmod(fixture, 0o755);
     const root = await mkdtemp(

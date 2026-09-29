@@ -389,6 +389,12 @@ class OpenCodeHarnessSession implements HarnessSession {
   // the rest of the session, even after a new turn attaches.
   readonly #sealedTurnIds = new Set<string>();
   readonly #seenProviderEvents = new Set<string>();
+  // The turn that created each native message. A raw OpenCode frame carries
+  // no turn identity of its own, so this map — not the mutable active-turn
+  // pointer, which can already have moved on to a later turn by the time a
+  // straggling frame for this message arrives — is the source of truth for
+  // which turn a message's content belongs to.
+  readonly #messageTurnIds = new Map<string, string>();
   readonly #messageRoles = new Map<string, string>();
   readonly #pendingMessageParts = new Map<
     string,
@@ -1386,7 +1392,7 @@ class OpenCodeHarnessSession implements HarnessSession {
         "runtime_request.resolved",
         harnessRuntimeRequestOutcome(pending.request, { action }),
         {
-          turnId,
+          turnId: pending.request.turnId,
           itemId: pending.request.itemId,
         },
       );
@@ -1413,16 +1419,21 @@ class OpenCodeHarnessSession implements HarnessSession {
             ? { action: "submit", response: pending.submittedResponse }
             : { reason: "provider_rejected" },
         ),
-        { turnId, itemId: pending.request.itemId },
+        { turnId: pending.request.turnId, itemId: pending.request.itemId },
       );
       return;
     }
-    if (type === "message.part.updated" && turnId) {
+    if (type === "message.part.updated") {
       const part = record(properties.part);
       const messageId = text(part.messageID, text(part.messageId));
       if (!messageId) return;
+      // Resolve the turn this message actually belongs to, not whichever
+      // turn is active right now. A straggling part for an earlier message
+      // must stay attributed to the turn that created that message.
+      const owningTurnId = this.#messageTurnIds.get(messageId) ?? turnId;
+      if (!owningTurnId) return;
       const role = this.#messageRoles.get(messageId);
-      if (role === "assistant") this.#emitAssistantPart(part, turnId);
+      if (role === "assistant") this.#emitAssistantPart(part, owningTurnId);
       else if (role === undefined) {
         const pending = this.#pendingMessageParts.get(messageId) ?? [];
         if (pending.length < 100) pending.push(part);
@@ -1430,19 +1441,29 @@ class OpenCodeHarnessSession implements HarnessSession {
       }
       return;
     }
-    if (type === "message.updated" && turnId) {
+    if (type === "message.updated") {
       const info = record(properties.info);
       const messageId = text(
         info.id,
         text(info.messageID, text(info.messageId)),
       );
       const role = text(info.role);
+      // Record the message's owning turn at the moment OpenCode first
+      // reports it. A later turn that reuses the same native message id
+      // legitimately reclaims ownership; a stale message never sees this
+      // branch again, so its recorded owner never changes.
+      if (messageId && role && turnId) this.#messageTurnIds.set(messageId, turnId);
+      const owningTurnId = messageId
+        ? (this.#messageTurnIds.get(messageId) ?? turnId)
+        : turnId;
+      if (!owningTurnId) return;
       if (messageId && role) {
         this.#messageRoles.set(messageId, role);
         const pending = this.#pendingMessageParts.get(messageId) ?? [];
         this.#pendingMessageParts.delete(messageId);
         if (role === "assistant")
-          for (const part of pending) this.#emitAssistantPart(part, turnId);
+          for (const part of pending)
+            this.#emitAssistantPart(part, owningTurnId);
       }
       const tokens = record(info.tokens);
       if (
@@ -1468,7 +1489,7 @@ class OpenCodeHarnessSession implements HarnessSession {
           this.#emit(
             "item.completed",
             { kind: "usage", usage: this.#usage, usageMessageId: messageId },
-            { turnId, itemId: `${turnId}:usage` },
+            { turnId: owningTurnId, itemId: `${owningTurnId}:usage` },
           );
         }
       }
