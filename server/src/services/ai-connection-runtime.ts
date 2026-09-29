@@ -65,6 +65,25 @@ export function stripAiAuthBindings(env: unknown): Record<string, unknown> {
       delete result[key];
   return result;
 }
+// Project settings keys that would override or redirect a managed AI credential.
+// A Claude Code settings-file `env` block takes precedence over the process env, so
+// ANTHROPIC_BASE_URL / ANTHROPIC_CUSTOM_HEADERS in a repo's .claude/settings*.json
+// could send the connection's credential to a host (or with headers) the repo chose.
+const PROJECT_AUTH_OVERRIDE_KEYS = [
+  "apiKeyHelper",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_CUSTOM_HEADERS",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "OPENAI_API_KEY",
+] as const;
+export const PROJECT_AUTH_OVERRIDE_PATTERN = new RegExp(
+  `${PROJECT_AUTH_OVERRIDE_KEYS.join("|")}|model_provider\\s*=|env_key\\s*=|experimental_bearer_token|cli_auth_credentials_store`,
+);
+export const PROJECT_AUTH_OVERRIDE_SHELL_PATTERN =
+  `${PROJECT_AUTH_OVERRIDE_KEYS.join("|")}|model_provider[[:space:]]*=|env_key[[:space:]]*=|experimental_bearer_token|cli_auth_credentials_store`;
+
 export async function assertManagedAiProjectAuth(
   config: Record<string, unknown>,
   provider: AiConnectionBinding["provider"],
@@ -94,8 +113,7 @@ export async function assertManagedAiProjectAuth(
       : provider === "openai"
         ? [".codex/config.toml"]
         : [];
-  const pattern =
-    "apiKeyHelper|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|OPENAI_API_KEY|model_provider[[:space:]]*=|env_key[[:space:]]*=|experimental_bearer_token|cli_auth_credentials_store";
+  const pattern = PROJECT_AUTH_OVERRIDE_SHELL_PATTERN;
   if (target?.kind === "remote" && files.length) {
     // Only inspect for conflicting keys; never return configuration or credential values.
     const result = await runAdapterExecutionTargetProcess(
@@ -147,9 +165,7 @@ done`,
       try {
         const content = await readFile(path.join(directory, relative), "utf8");
         if (
-          /apiKeyHelper|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|OPENAI_API_KEY|model_provider\s*=|env_key\s*=|experimental_bearer_token|cli_auth_credentials_store/.test(
-            content,
-          )
+          PROJECT_AUTH_OVERRIDE_PATTERN.test(content)
         ) {
           throw unprocessable(
             "Project authentication settings conflict with the selected AI connection",
