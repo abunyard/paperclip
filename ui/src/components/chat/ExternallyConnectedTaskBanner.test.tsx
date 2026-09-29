@@ -104,7 +104,7 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
           <ExternallyConnectedTaskBanner
             attachments={attachments}
             companyId="company-1"
-            issueId="issue-1"
+            issueId="11111111-1111-4111-8111-111111111111"
             issueCacheRefs={issueCacheRefs}
           />
         </QueryClientProvider>,
@@ -189,7 +189,7 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
     const attachment = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
-      issueId: "issue-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
       issueCommentId: null,
       assetId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
       provider: "local_disk",
@@ -278,7 +278,7 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
     await flushReact();
     expect(uploadAttachmentMock).toHaveBeenCalledWith(
       "company-1",
-      "issue-1",
+      "11111111-1111-4111-8111-111111111111",
       file,
     );
     expect(findButton(container, "Uploading…").disabled).toBe(true);
@@ -290,7 +290,7 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
     finishUpload({
       id: "uploaded-image",
       companyId: "company-1",
-      issueId: "issue-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
       issueCommentId: null,
       originalFilename: "cat.png",
     });
@@ -318,7 +318,7 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
       readBoardSendDraft(
         boardSendDraftKey(
           "company-1",
-          "issue-1",
+          "11111111-1111-4111-8111-111111111111",
           "endpoint-1",
           "conversation-1",
         ),
@@ -378,7 +378,7 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
       input!.dispatchEvent(new Event("change", { bubbles: true }));
     });
     await flushReact();
-    queryClient.setQueryData(["issue-chat-binding", "company-1", "issue-1"], {
+    queryClient.setQueryData(["issue-chat-binding", "company-1", "11111111-1111-4111-8111-111111111111"], {
       endpointId: "endpoint-2",
       conversationId: "conversation-2",
       provider: "slack",
@@ -390,7 +390,7 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
     finishUpload({
       id: "old-upload",
       companyId: "company-1",
-      issueId: "issue-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
       issueCommentId: null,
       originalFilename: "old.txt",
     });
@@ -409,7 +409,7 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
       const attachment = {
         id: "file-selected",
         companyId: "company-1",
-        issueId: "issue-1",
+        issueId: "11111111-1111-4111-8111-111111111111",
         issueCommentId: null,
         assetId: "asset-selected",
         provider: "local_disk",
@@ -564,7 +564,7 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
     mockChatEndpointsApi.getPublicationBatchStatus.mockRejectedValue(
       new Error("Status temporarily unavailable"),
     );
-    const queryClient = await renderBanner([], ["issue-1", "CHA-2"]);
+    const queryClient = await renderBanner([], ["11111111-1111-4111-8111-111111111111", "CHA-2"]);
     const invalidated = vi.spyOn(queryClient, "invalidateQueries");
     await composeAndSubmit();
     await flushReact();
@@ -607,7 +607,7 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
       const attachment = {
         id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         companyId: "company-1",
-        issueId: "issue-1",
+        issueId: "11111111-1111-4111-8111-111111111111",
         issueCommentId: null,
         assetId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
         provider: "local_disk",
@@ -726,7 +726,7 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
     const file = {
       id: "bound-file",
       companyId: "company-1",
-      issueId: "issue-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
       issueCommentId: null,
       originalFilename: "report.txt",
     } as IssueAttachment;
@@ -1064,7 +1064,7 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
           readBoardSendDraft(
             boardSendDraftKey(
               "company-1",
-              "issue-1",
+              "11111111-1111-4111-8111-111111111111",
               "endpoint-1",
               "conversation-1",
             ),
@@ -1189,7 +1189,7 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
       "Delivery result not confirmed",
     );
     const originalCall = mockChatEndpointsApi.publishBoardMessage.mock.calls[0];
-    queryClient.setQueryData(["issue-chat-binding", "company-1", "issue-1"], {
+    queryClient.setQueryData(["issue-chat-binding", "company-1", "11111111-1111-4111-8111-111111111111"], {
       endpointId: "endpoint-2",
       conversationId: "conversation-2",
       provider: "slack",
@@ -1213,7 +1213,7 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
       readBoardSendDraft(
         boardSendDraftKey(
           "company-1",
-          "issue-1",
+          "11111111-1111-4111-8111-111111111111",
           "endpoint-1",
           "conversation-1",
         ),
@@ -1227,7 +1227,7 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
       readBoardSendDraft(
         boardSendDraftKey(
           "company-1",
-          "issue-1",
+          "11111111-1111-4111-8111-111111111111",
           "endpoint-2",
           "conversation-2",
         ),
