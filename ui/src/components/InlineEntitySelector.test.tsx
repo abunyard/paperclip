@@ -102,6 +102,43 @@ describe("InlineEntitySelector", () => {
     }
   });
 
+  it("opens on the next keyboard focus after a desktop outside dismissal", async () => {
+    const root = createRoot(container);
+    await act(() => {
+      root.render(<>
+        <button type="button" data-testid="outside-picker">Outside</button>
+        <InlineEntitySelector
+          value=""
+          options={[{ id: "agent-1", label: "Agent One" }]}
+          placeholder="Assignee"
+          noneLabel="No assignee"
+          searchPlaceholder="Search assignees..."
+          emptyMessage="No assignees found."
+          onChange={vi.fn()}
+          triggerTestId="desktop-assignee-picker"
+        />
+      </>);
+    });
+    try {
+      const trigger = container.querySelector<HTMLButtonElement>("[data-testid=desktop-assignee-picker]")!;
+      const outside = container.querySelector<HTMLButtonElement>("[data-testid=outside-picker]")!;
+      await act(() => trigger.click());
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      await act(() => {
+        outside.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true }));
+        outside.focus();
+        outside.click();
+      });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(document.querySelector("[data-mobile-entity-picker]")).toBeNull();
+      expect(document.activeElement).toBe(outside);
+      await act(() => trigger.focus());
+      expect(document.querySelector("[data-mobile-entity-picker]")).not.toBeNull();
+    } finally {
+      await act(() => root.unmount());
+    }
+  });
+
   it("keeps handled search navigation keys inside the popover", async () => {
     const root = createRoot(container);
     const onChange = vi.fn();

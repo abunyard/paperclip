@@ -192,6 +192,9 @@ export const InlineEntitySelector = forwardRef<HTMLButtonElement, InlineEntitySe
               // Radix returns focus to the trigger on Escape/outside dismissal.
               // That focus must not immediately reopen the picker.
               suppressNextTriggerFocusRef.current = true;
+              // Non-modal outside dismissal may keep focus on the clicked
+              // element instead. Limit suppression to Radix's synchronous restore.
+              queueMicrotask(() => { suppressNextTriggerFocusRef.current = false; });
               return;
             }
             event.preventDefault();
