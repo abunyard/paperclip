@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import pc from "picocolors";
-import { buildCliCommandLabel } from "./command-label.js";
+import { buildCliCommandLabel, clampCliAuthCommandLabel } from "./command-label.js";
 import { resolveDefaultCliAuthPath } from "../config/home.js";
 
 type RequestedAccess = "board" | "instance_admin_required";
@@ -211,7 +211,7 @@ export async function loginBoardCli(params: {
 }): Promise<{ token: string; approvalUrl: string; userId?: string | null }> {
   const apiBase = normalizeApiBase(params.apiBase);
   const createUrl = `${apiBase}/api/cli-auth/challenges`;
-  const command = params.command?.trim() || buildCliCommandLabel();
+  const command = clampCliAuthCommandLabel(params.command?.trim() || buildCliCommandLabel());
 
   const challenge = await requestJson<CreateChallengeResponse>(createUrl, {
     method: "POST",
