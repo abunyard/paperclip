@@ -56,3 +56,19 @@ export function readTrimmedEnv(env: Record<string, string | undefined>) {
     return typeof value === "string" ? value.trim() : "";
   };
 }
+
+/**
+ * wabnet fork: an `anthropic_compatible` managed connection names its own biller and bills
+ * as a fixed plan (operator decision 2026-09-29: 0 cents, tokens tracked). The server
+ * passes this as config.managedAiConnection.endpointBilling; it overrides the env-based
+ * classification above.
+ */
+export function applyManagedEndpointBilling(identity: ClaudeBillingIdentity, config: unknown): ClaudeBillingIdentity {
+  const managed = (config as { managedAiConnection?: { provider?: unknown; endpointBilling?: { type?: unknown; biller?: unknown } } } | null)
+    ?.managedAiConnection;
+  if (managed?.provider !== "anthropic_compatible") return identity;
+  const biller = typeof managed.endpointBilling?.biller === "string" && managed.endpointBilling.biller.trim()
+    ? managed.endpointBilling.biller.trim()
+    : identity.biller;
+  return { biller, billingType: managed.endpointBilling?.type === "fixed" ? "fixed" : identity.billingType };
+}

@@ -18,6 +18,8 @@ import {
   localAiConnectionSchema,
   localAiLoginStartSchema,
   isAiConnectionCompatible,
+  anthropicCompatibleEndpointSchema,
+  type AnthropicCompatibleEndpoint,
   type AiConnectionLoginIntent,
   type AiProvider,
   type AiConnectionBinding,
@@ -27,6 +29,15 @@ import { forbidden, notFound, unprocessable } from "../errors.js";
 import { accessService } from "../services/access.js";
 import { logActivity } from "../services/activity-log.js";
 import { aiConnectionService } from "../services/ai-connections.js";
+import {
+  applyEnvAgentMigration,
+  loadMigrationRows,
+  planEnvAgentMigration,
+} from "../services/anthropic-compatible-migration.js";
+import {
+  discoverAnthropicCompatibleModels,
+  probeAnthropicCompatibleEndpoint,
+} from "../services/anthropic-compatible-endpoint.js";
 import { validate } from "../middleware/validate.js";
 
 /** Agent API calls inherit authenticated run identity, never the agent's own ID. */
@@ -137,7 +148,13 @@ export async function validateAiApiKey(
   provider: AiProvider,
   key: string,
   request: typeof fetch = fetch,
+  endpoint?: AnthropicCompatibleEndpoint,
 ) {
+  if (provider === "anthropic_compatible") {
+    // wabnet fork: no fixed provider URL; probe the configured endpoint instead.
+    if (!endpoint) throw unprocessable("An Anthropic-compatible connection needs an endpoint");
+    return probeAnthropicCompatibleEndpoint(endpoint, key, request);
+  }
   const endpoints = {
     anthropic: "https://api.anthropic.com/v1/models?limit=1",
     openai: "https://api.openai.com/v1/models",
@@ -264,6 +281,55 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
       );
     },
   );
+  // wabnet fork: test an Anthropic-compatible endpoint, or list its models, before saving.
+  // Board users who may create AI connections only; the key is used once and never stored here.
+  const anthropicCompatibleProbeSchema = z
+    .object({
+      endpoint: anthropicCompatibleEndpointSchema,
+      apiKey: z.string().trim().min(1).max(32768),
+    })
+    .strict();
+  async function anthropicCompatibleProbeCredential(req: Request, companyId: string, body: z.infer<typeof anthropicCompatibleProbeSchema>) {
+    await assertAiConnectionCreateAccess(db, req, companyId, { ownership: "personal", allAgents: false, agentIds: [] });
+    return body.apiKey;
+  }
+  router.post("/companies/:companyId/ai-connections/anthropic-compatible/test", validate(anthropicCompatibleProbeSchema), async (req, res) => {
+    const companyId = req.params.companyId as string;
+    const body = anthropicCompatibleProbeSchema.parse(req.body);
+    await probeAnthropicCompatibleEndpoint(body.endpoint, await anthropicCompatibleProbeCredential(req, companyId, body));
+    res.json({ ok: true });
+  });
+  router.post("/companies/:companyId/ai-connections/anthropic-compatible/models", validate(anthropicCompatibleProbeSchema), async (req, res) => {
+    const companyId = req.params.companyId as string;
+    const body = anthropicCompatibleProbeSchema.parse(req.body);
+    res.json({ models: await discoverAnthropicCompatibleModels(body.endpoint, await anthropicCompatibleProbeCredential(req, companyId, body)) });
+  });
+  // wabnet fork: migrate env-routed claude_local agents onto anthropic_compatible connections.
+  // Dry-run unless `apply: true` with the planHash the dry-run returned.
+  const migrateEnvAgentsSchema = z
+    .object({ apply: z.boolean().default(false), planHash: z.string().regex(/^[0-9a-f]{16}$/).optional() })
+    .strict()
+    .refine((v) => !v.apply || Boolean(v.planHash), { message: "apply requires the planHash from a dry-run" });
+  router.post("/companies/:companyId/ai-connections/anthropic-compatible/migrate-env-agents", validate(migrateEnvAgentsSchema), async (req, res) => {
+    const companyId = req.params.companyId as string;
+    const body = migrateEnvAgentsSchema.parse(req.body);
+    const userId = await assertAiConnectionCreateAccess(db, req, companyId, { ownership: "shared", allAgents: false, agentIds: [] });
+    if (!body.apply) {
+      res.json({ dryRun: true, ...planEnvAgentMigration(companyId, await loadMigrationRows(db, companyId)) });
+      return;
+    }
+    const applied = await applyEnvAgentMigration(db, companyId, userId, body.planHash!);
+    await logActivity(db, {
+      companyId,
+      actorType: "user",
+      actorId: userId,
+      action: "ai_connection.env_agents_migrated",
+      entityType: "company",
+      entityId: companyId,
+      details: { planHash: applied.planHash, groups: applied.results.length, agents: applied.results.flatMap((r) => r.agents).length },
+    });
+    res.json({ dryRun: false, ...applied });
+  });
   router.post(
     "/companies/:companyId/ai-connections",
     validate(createAiConnectionSchema),
@@ -281,7 +347,7 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
           "Use the existing provider sign-in flow to connect a subscription",
         );
       const attemptStartedAt = new Date();
-      await validateAiApiKey(input.provider, input.apiKey!);
+      await validateAiApiKey(input.provider, input.apiKey!, fetch, input.endpoint);
       const result = await service.save(
         companyId,
         userId,

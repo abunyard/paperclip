@@ -5159,11 +5159,13 @@ function resolveLedgerBiller(result: AdapterExecutionResult): string {
   );
 }
 
-function normalizeBilledCostCents(
+export function normalizeBilledCostCents(
   costUsd: number | null | undefined,
   billingType: BillingType,
 ): number {
-  if (billingType === "subscription_included") return 0;
+  // wabnet fork: a fixed plan (e.g. an anthropic_compatible endpoint on a token plan) has
+  // no marginal cost; the client's cost estimate uses Anthropic list prices, so drop it.
+  if (billingType === "subscription_included" || billingType === "fixed") return 0;
   if (typeof costUsd !== "number" || !Number.isFinite(costUsd)) return 0;
   return Math.max(0, Math.round(costUsd * 100));
 }

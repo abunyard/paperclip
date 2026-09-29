@@ -1,6 +1,6 @@
 import { listOpenRouterModels } from "../services/openrouter-models.js";
 import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings } from "../services/ai-connection-runtime.js";
-import { ADAPTER_AUTH_MISSING_CHECK_CODE, AI_CONNECTION_CAPABILITIES, aiConnectionBindingSchema, type AiConnectionBinding } from "@paperclipai/shared";
+import { ADAPTER_AUTH_MISSING_CHECK_CODE, AI_CONNECTION_CAPABILITIES, aiConnectionBindingSchema, anthropicCompatibleEndpointSchema, type AiConnectionBinding } from "@paperclipai/shared";
 import { toolConnections } from "@paperclipai/db";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { defaultAiConnectionForHire } from "../services/agent-ai-connection-default.js";
@@ -3307,11 +3307,24 @@ export function agentRoutes(
     // only a provider CLI reads, so proving the runtime lane can consume it
     // takes a real hello turn.
     if (resolvedMethod === "api_key") {
-      const envKey = AI_CONNECTION_CAPABILITIES[binding.provider].methods.api_key?.envKey;
-      const key = envKey ? parseObject(context.config.env)[envKey] : undefined;
+      const runtimeEnv = parseObject(context.config.env);
+      // wabnet fork: an anthropic_compatible key may sit in either credential var,
+      // and it is verified against the endpoint the runtime was prepared for.
+      const envKey = binding.provider === "anthropic_compatible"
+        ? (typeof runtimeEnv.ANTHROPIC_API_KEY === "string" && runtimeEnv.ANTHROPIC_API_KEY ? "ANTHROPIC_API_KEY" : "ANTHROPIC_AUTH_TOKEN")
+        : AI_CONNECTION_CAPABILITIES[binding.provider].methods.api_key?.envKey;
+      const key = envKey ? runtimeEnv[envKey] : undefined;
       try {
         if (typeof key !== "string" || !key) throw unprocessable("The selected account's API key was not available to verify.");
-        await validateAiApiKey(binding.provider, key);
+        const endpoint = binding.provider === "anthropic_compatible"
+          ? anthropicCompatibleEndpointSchema.parse({
+              baseUrl: runtimeEnv.ANTHROPIC_BASE_URL,
+              authHeader: envKey === "ANTHROPIC_API_KEY" ? "x-api-key" : "bearer",
+              models: typeof runtimeEnv.ANTHROPIC_MODEL === "string" && runtimeEnv.ANTHROPIC_MODEL ? [runtimeEnv.ANTHROPIC_MODEL] : [],
+              billing: { biller: "verification" },
+            })
+          : undefined;
+        await validateAiApiKey(binding.provider, key, fetch, endpoint);
         result.checks.push({ code: "ai_connection_api_key_reverified", level: "info", message: "The provider verified this API key for adoption." });
       } catch (error) {
         result.status = "fail";
@@ -3320,7 +3333,7 @@ export function agentRoutes(
       return result;
     }
     if (!result.checks.some(check => check.code.includes("hello_probe"))) {
-      const providerAdapter = { anthropic: "claude_local", openai: "codex_local", openrouter: "opencode_local", xai: "grok_local" }[binding.provider];
+      const providerAdapter = { anthropic: "claude_local", openai: "codex_local", openrouter: "opencode_local", xai: "grok_local", anthropic_compatible: "claude_local" }[binding.provider];
       const probe = await requireServerAdapter(providerAdapter).testEnvironment({ ...context, adapterType: providerAdapter, config: { ...context.config, engine: "cli" } });
       result.checks.push(...probe.checks);
       result.status = probe.status === "fail" ? "fail" : result.status === "warn" || probe.status === "warn" ? "warn" : "pass";

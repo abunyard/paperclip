@@ -91,7 +91,7 @@ import {
 } from "./cli-capabilities.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
-import { readTrimmedEnv, resolveClaudeBillingIdentity } from "./billing.js";
+import { applyManagedEndpointBilling, readTrimmedEnv, resolveClaudeBillingIdentity } from "./billing.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
 import { buildClaudeExecutionPermissionArgs } from "./permissions.js";
 import { resolveClaudeModel, SANDBOX_INSTALL_COMMAND } from "../index.js";
@@ -490,7 +490,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const modelEnv = executionTargetIsRemote ? env : effectiveEnv;
   const model = resolveClaudeModel(config.model, modelEnv);
   // Shared with the ACP lane: a gateway credential is never a subscription.
-  const { biller: resolvedBiller, billingType } = resolveClaudeBillingIdentity(readTrimmedEnv(effectiveEnv));
+  const { biller: resolvedBiller, billingType } = applyManagedEndpointBilling(
+    resolveClaudeBillingIdentity(readTrimmedEnv(effectiveEnv)),
+    config,
+  );
   const claudeSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredSkillNames = new Set(resolveClaudeDesiredSkillNames(config, claudeSkillEntries));
   // When instructionsFilePath is configured, build a stable content-addressed

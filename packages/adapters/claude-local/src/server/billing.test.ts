@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isAnthropicApiBaseUrl, resolveClaudeBillingIdentity } from "./billing.js";
+import { applyManagedEndpointBilling, isAnthropicApiBaseUrl, resolveClaudeBillingIdentity } from "./billing.js";
 
 const read = (env: Record<string, string>) => (key: string) => env[key]?.trim() ?? "";
 
@@ -40,5 +40,18 @@ describe("resolveClaudeBillingIdentity", () => {
     expect(isAnthropicApiBaseUrl("https://api.anthropic.com/")).toBe(true);
     expect(isAnthropicApiBaseUrl("https://api.anthropic.com.evil.example")).toBe(false);
     expect(isAnthropicApiBaseUrl("not a url")).toBe(false);
+  });
+});
+
+describe("applyManagedEndpointBilling (wabnet anthropic_compatible)", () => {
+  const gateway = { biller: "127.0.0.1", billingType: "unknown" as const };
+  it("uses the connection's biller and fixed billing", () => {
+    expect(applyManagedEndpointBilling(gateway, { managedAiConnection: { provider: "anthropic_compatible", endpointBilling: { type: "fixed", biller: "switchyard" } } }))
+      .toEqual({ biller: "switchyard", billingType: "fixed" });
+  });
+  it("leaves other providers and unmanaged runs alone", () => {
+    expect(applyManagedEndpointBilling(gateway, { managedAiConnection: { provider: "anthropic", endpointBilling: { type: "fixed", biller: "x" } } })).toEqual(gateway);
+    expect(applyManagedEndpointBilling(gateway, {})).toEqual(gateway);
+    expect(applyManagedEndpointBilling(gateway, null)).toEqual(gateway);
   });
 });

@@ -20,6 +20,7 @@ import {
 import {
   AI_CONNECTION_CAPABILITIES,
   aiConnectionMetadataSchema,
+  anthropicCompatibleEndpointSchema,
   aiSubscriptionNeedsIsolatedLogin,
   isAiConnectionCompatible,
   type AiConnectionBinding,
@@ -142,6 +143,12 @@ export function aiConnectionService(db: Db) {
             owners.find((owner) => owner.id === grant.subjectUserId)?.name ??
             (grant.subjectUserId === userId ? "You" : "Account owner"),
           isDefault: defaults.some((d) => d.grantId === grant.id),
+          ...(metadata.data.provider === "anthropic_compatible"
+            ? (() => {
+                const endpoint = anthropicCompatibleEndpointSchema.safeParse(connection.config.aiEndpoint);
+                return endpoint.success ? { endpoint: endpoint.data } : {};
+              })()
+            : {}),
           status:
             grant.status === "revoked"
               ? ("revoked" as const)
@@ -468,6 +475,7 @@ export function aiConnectionService(db: Db) {
       );
     const id = reconnect?.connection.id ?? randomUUID();
     const grantId = reconnect?.grant.id ?? randomUUID();
+    const endpoint = "endpoint" in input ? input.endpoint : undefined;
     return db.transaction(async (tx) => {
       const secrets = secretService(tx);
       if (sessionId) {
@@ -625,7 +633,12 @@ export function aiConnectionService(db: Db) {
             status: "active",
             healthStatus: "ok",
             healthMessage: null,
-            config: { ...reconnect.connection.config, aiIsolatedSubscription: input.method === "subscription" && input.provider !== "anthropic" },
+            config: {
+              ...reconnect.connection.config,
+              aiIsolatedSubscription: input.method === "subscription" && input.provider !== "anthropic",
+              // wabnet fork: a reconnect may change the endpoint (URL, models, mapping).
+              ...(endpoint ? { aiEndpoint: endpoint } : {}),
+            },
             updatedAt: new Date(),
           })
           .where(eq(toolConnections.id, id));
@@ -649,6 +662,9 @@ export function aiConnectionService(db: Db) {
             config: {
               sourceTemplateKey: input.provider,
               ai: { provider: input.provider, method: input.method },
+              // wabnet fork: routing metadata for anthropic_compatible. Kept outside `ai`,
+              // whose metadata schema is strict and shared with older code paths.
+              ...(endpoint ? { aiEndpoint: endpoint } : {}),
               aiIsolatedSubscription: input.method === "subscription" && input.provider !== "anthropic",
             },
             createdByUserId: userId,

@@ -1,10 +1,19 @@
 import { describe, expect, it } from "vitest";
 import {
+  normalizeBilledCostCents,
   resolveCacheAdjustedCostUsd,
   resolveLedgerCostStatus,
 } from "../services/heartbeat.js";
 
 describe("heartbeat cost accounting", () => {
+  it("bills fixed plans (wabnet anthropic_compatible presets) at 0 cents, like included subscriptions", () => {
+    // Claude Code's cost estimate uses Anthropic list prices, which do not apply to a fixed plan.
+    expect(normalizeBilledCostCents(1.25, "fixed")).toBe(0);
+    expect(normalizeBilledCostCents(1.25, "subscription_included")).toBe(0);
+    expect(normalizeBilledCostCents(1.25, "unknown")).toBe(125);
+    expect(normalizeBilledCostCents(1.25, "metered_api")).toBe(125);
+  });
+
   it("marks token-bearing CLI usage without a reported cost as unpriced", () => {
     expect(resolveLedgerCostStatus({
       costUsd: null,

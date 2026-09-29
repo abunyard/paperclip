@@ -52,7 +52,7 @@ import {
 import { createWorkspaceRestoreTeardown } from "@paperclipai/adapter-utils/workspace-restore-teardown";
 import { buildLocalAdapterTestProbeEnv } from "./probe-env.js";
 import { detectClaudeLoginRequired, parseClaudeStreamJson } from "./parse.js";
-import { resolveClaudeBillingIdentity } from "./billing.js";
+import { applyManagedEndpointBilling, resolveClaudeBillingIdentity } from "./billing.js";
 import { buildClaudeProbePermissionArgs } from "./permissions.js";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE } from "./auth-check.js";
 import { resolveClaudeModel, SANDBOX_INSTALL_COMMAND } from "../index.js";
@@ -178,7 +178,7 @@ export function resolveClaudeAcpBillingIdentity(
     return typeof fromHost === "string" ? fromHost.trim() : "";
   };
   // One classifier for both Claude lanes (CLI and ACP). See billing.ts.
-  const { biller, billingType } = resolveClaudeBillingIdentity(readEnvValue);
+  const { biller, billingType } = applyManagedEndpointBilling(resolveClaudeBillingIdentity(readEnvValue), ctx.config);
   return { provider: "anthropic", biller, billingType };
 }
 

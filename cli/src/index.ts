@@ -51,6 +51,7 @@ import { uninstallCommand } from "./commands/uninstall.js";
 import { updateCommand } from "./commands/update.js";
 import { registerServiceCommands } from "./commands/service.js";
 import { registerConnectionIntentCommands } from "./commands/client/connections.js";
+import { registerAiConnectionCommands } from "./commands/client/ai-connections.js";
 import {
   assertTestDriveDatabaseIsolation,
   prepareTestDriveEnvironment,
@@ -234,6 +235,7 @@ heartbeat
 registerContextCommands(program);
 registerConnectCommand(program);
 registerConnectionIntentCommands(program);
+registerAiConnectionCommands(program);
 registerEmailCommands(program);
 registerCompanyCommands(program);
 registerIssueCommands(program);

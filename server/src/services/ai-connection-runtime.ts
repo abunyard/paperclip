@@ -10,6 +10,20 @@ import {
   type AiConnectionBinding,
 } from "@paperclipai/shared";
 import { aiConnectionService } from "./ai-connections.js";
+import {
+  anthropicCompatibleBilling,
+  anthropicCompatibleRuntimeEnv,
+  endpointFromConnectionConfig,
+} from "./anthropic-compatible-endpoint.js";
+
+// Per-agent model overrides allowed on top of an anthropic_compatible connection's defaults.
+const ANTHROPIC_COMPATIBLE_AGENT_OVERRIDABLE_KEYS = new Set([
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "CLAUDE_CODE_SUBAGENT_MODEL",
+]);
 import { secretService } from "./secrets.js";
 import { decideCodexAuthMerge } from "@paperclipai/adapter-codex-local/server";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
@@ -322,6 +336,19 @@ export async function prepareManagedAiRuntime(
       );
     if (subscriptionFile) await writeFile(authFile, value, { mode: 0o600 });
     else env[capability.envKey] = value;
+    let endpointBilling: ReturnType<typeof anthropicCompatibleBilling> | undefined;
+    if (input.binding.provider === "anthropic_compatible") {
+      // wabnet fork: the connection owns routing. The credential goes in the variable
+      // the endpoint's auth header needs; model vars already set on the agent win.
+      const endpoint = endpointFromConnectionConfig(selection.connection.config);
+      delete env[capability.envKey];
+      for (const [key, next] of Object.entries(anthropicCompatibleRuntimeEnv(endpoint, value, input.config.model))) {
+        const agentValue = configuredEnv[key];
+        if (ANTHROPIC_COMPATIBLE_AGENT_OVERRIDABLE_KEYS.has(key) && typeof agentValue === "string" && agentValue.trim()) continue;
+        env[key] = next;
+      }
+      endpointBilling = anthropicCompatibleBilling(endpoint);
+    }
     if (
       input.binding.provider === "openai" &&
       selection.attribution.method === "api_key"
@@ -346,7 +373,7 @@ export async function prepareManagedAiRuntime(
       config: {
         ...input.config,
         env,
-        managedAiConnection: { ...selection.attribution, identity },
+        managedAiConnection: { ...selection.attribution, identity, ...(endpointBilling ? { endpointBilling } : {}) },
       },
       attribution: selection.attribution,
       accountName: selection.connection.name,
