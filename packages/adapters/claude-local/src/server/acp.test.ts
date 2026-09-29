@@ -1357,6 +1357,12 @@ describe("resolveClaudeAcpBillingIdentity", () => {
     });
   });
 
+  it("does not classify a gateway bearer token as a subscription (ACP lane)", () => {
+    expect(
+      resolveClaudeAcpBillingIdentity({ config: { env: { ANTHROPIC_BASE_URL: "https://api.minimax.io/anthropic", ANTHROPIC_AUTH_TOKEN: "gateway-token" } } }),
+    ).toEqual({ provider: "anthropic", biller: "api.minimax.io", billingType: "unknown" });
+  });
+
   it("ignores host env for remote execution targets", () => {
     process.env.ANTHROPIC_API_KEY = "sk-ant-host-only";
     expect(

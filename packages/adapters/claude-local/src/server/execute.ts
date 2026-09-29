@@ -91,6 +91,7 @@ import {
 } from "./cli-capabilities.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
+import { readTrimmedEnv, resolveClaudeBillingIdentity } from "./billing.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
 import { buildClaudeExecutionPermissionArgs } from "./permissions.js";
 import { resolveClaudeModel, SANDBOX_INSTALL_COMMAND } from "../index.js";
@@ -161,11 +162,6 @@ function isBedrockAuth(env: Record<string, string>): boolean {
     env.CLAUDE_CODE_USE_BEDROCK === "true" ||
     hasNonEmptyEnvValue(env, "ANTHROPIC_BEDROCK_BASE_URL")
   );
-}
-
-function resolveClaudeBillingType(env: Record<string, string>): "api" | "subscription" | "metered_api" {
-  if (isBedrockAuth(env)) return "metered_api";
-  return hasNonEmptyEnvValue(env, "ANTHROPIC_API_KEY") ? "api" : "subscription";
 }
 
 async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<ClaudeRuntimeConfig> {
@@ -493,7 +489,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   );
   const modelEnv = executionTargetIsRemote ? env : effectiveEnv;
   const model = resolveClaudeModel(config.model, modelEnv);
-  const billingType = resolveClaudeBillingType(effectiveEnv);
+  // Shared with the ACP lane: a gateway credential is never a subscription.
+  const { biller: resolvedBiller, billingType } = resolveClaudeBillingIdentity(readTrimmedEnv(effectiveEnv));
   const claudeSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredSkillNames = new Set(resolveClaudeDesiredSkillNames(config, claudeSkillEntries));
   // When instructionsFilePath is configured, build a stable content-addressed
@@ -1247,7 +1244,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       sessionParams: resolvedSessionParams,
       sessionDisplayId: resolvedSessionId,
       provider: "anthropic",
-      biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
+      biller: resolvedBiller,
       model: parsedStream.model || asString(parsed.model, model),
       billingType,
       costUsd: parsedStream.costUsd,
@@ -1295,7 +1292,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage,
           errorCode: "claude_cli_version_incompatible",
           provider: "anthropic",
-          biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
+          biller: resolvedBiller,
           model,
           billingType,
           resultJson: {
