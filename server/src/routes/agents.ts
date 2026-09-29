@@ -438,6 +438,23 @@ async function withHireRunLock<T>(key: string, fn: () => Promise<T>): Promise<T>
   }
 }
 
+/**
+ * Compare two AI-connection bindings regardless of object key order (wabnet local fix L0004).
+ * A request binding is zod-parsed (schema key order); a stored binding comes back from
+ * Postgres jsonb, which reorders keys. JSON.stringify therefore saw identical bindings as
+ * different, and PATCH re-validated an unchanged binding (422 ai_connection_default_missing
+ * for board users without their own default; an extra hello probe for owners).
+ */
+export function aiConnectionBindingsEqual(a: unknown, b: unknown): boolean {
+  const canonical = (value: unknown): string => {
+    const parsed = aiConnectionBindingSchema.safeParse(value).data ?? value;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? JSON.stringify(Object.fromEntries(Object.entries(parsed as Record<string, unknown>).sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0))))
+      : JSON.stringify(parsed ?? null);
+  };
+  return canonical(a) === canonical(b);
+}
+
 export function agentRoutes(
   db: Db,
   options: {
@@ -5287,7 +5304,8 @@ export function agentRoutes(
     const nextAiBinding = aiConnectionBindingSchema.safeParse(requestedRuntimeConfig?.aiConnection ?? existing.runtimeConfig.aiConnection).data;
     if (nextAiBinding) {
       await assertCanUpdateAgent(req, existing);
-      const changed = JSON.stringify(nextAiBinding) !== JSON.stringify(existing.runtimeConfig.aiConnection);
+      // Key-order-insensitive (wabnet L0004): nextAiBinding is schema-parsed, the stored binding is raw jsonb.
+      const changed = !aiConnectionBindingsEqual(nextAiBinding, existing.runtimeConfig.aiConnection);
       const aiConfig = (patchData.adapterConfig ?? existing.adapterConfig) as Record<string, unknown>;
       if (!isAiConnectionCompatible(nextAiBinding, requestedAdapterType, aiConfig.model, aiConfig.provider, aiConfig.acpxAgent)) throw unprocessable("Select an AI connection compatible with the new harness and model");
       if (changed) await validateManagedAgentBinding(req, existing.companyId, existing.id, requestedAdapterType, aiConfig, nextAiBinding, (patchData.defaultEnvironmentId !== undefined ? patchData.defaultEnvironmentId : existing.defaultEnvironmentId) as string | null, true);
