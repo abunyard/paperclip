@@ -383,6 +383,11 @@ class OpenCodeHarnessSession implements HarnessSession {
   readonly #events = new AsyncQueue<PrpEvent>();
   readonly #transcript: PrpEvent[] = [];
   readonly #terminalTurns = new Map<string, string>();
+  // Turns whose terminal event has already reached the queue. Unlike
+  // `#terminalTurns`, `attachRun` never clears this set: a turn id is never
+  // reused, so a late provider frame for a sealed turn must stay blocked for
+  // the rest of the session, even after a new turn attaches.
+  readonly #sealedTurnIds = new Set<string>();
   readonly #seenProviderEvents = new Set<string>();
   readonly #messageRoles = new Map<string, string>();
   readonly #pendingMessageParts = new Map<
@@ -467,8 +472,10 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#resultFingerprint = restored?.fingerprint ?? null;
     this.#resultCallId = restored?.callId ?? null;
     this.#resultTurnId = restored?.turnId ?? null;
-    for (const terminal of input.snapshot?.terminalTurns ?? [])
+    for (const terminal of input.snapshot?.terminalTurns ?? []) {
       this.#terminalTurns.set(terminal.turnId, terminal.fingerprint);
+      this.#sealedTurnIds.add(terminal.turnId);
+    }
     if (this.#activeTurnId && this.#terminalTurns.has(this.#activeTurnId)) {
       this.#activeTurnId = null;
     }
@@ -523,6 +530,10 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#completedTextPartIds.clear();
     this.#completedReasoningPartIds.clear();
     this.#completedTextParts.length = 0;
+    // `#terminalTurns` clears here for its own persisted-snapshot bookkeeping.
+    // `#sealedTurnIds` does not clear: it is the event-queue gate, and a turn
+    // id is never reused, so a late frame for the just-finished turn must
+    // stay blocked even after this new run attaches.
     this.#terminalTurns.clear();
     this.#sendFullContext = false;
     this.#emit("run.attached", { runId: input.runId, sameSession: true });
@@ -1484,7 +1495,9 @@ class OpenCodeHarnessSession implements HarnessSession {
         );
       this.#activeTurnId = null;
       this.#emit("turn.completed", { status: "completed" }, { turnId });
-      this.#events.close();
+      // Seal only after the terminal event itself has gone through the gate
+      // in `#emit`; sealing first would make `#emit` drop this very event.
+      this.#sealedTurnIds.add(turnId);
       return;
     }
     if (type === "session.error" && turnId) {
@@ -1512,7 +1525,7 @@ class OpenCodeHarnessSession implements HarnessSession {
           { turnId },
         );
         this.#terminalTurns.set(turnId, canonicalJson({ status: "cancelled" }));
-        this.#events.close();
+        this.#sealedTurnIds.add(turnId);
         return;
       }
       this.#emit(
@@ -1539,7 +1552,7 @@ class OpenCodeHarnessSession implements HarnessSession {
         { turnId },
       );
       this.#terminalTurns.set(turnId, canonicalJson({ status: "failed" }));
-      this.#events.close();
+      this.#sealedTurnIds.add(turnId);
     }
   }
 
@@ -1804,6 +1817,23 @@ class OpenCodeHarnessSession implements HarnessSession {
     payload: Record<string, unknown>,
     refs: { turnId?: string; itemId?: string } = {},
   ): void {
+    if (
+      eventType !== "harness.diagnostic" &&
+      refs.turnId !== undefined &&
+      this.#sealedTurnIds.has(refs.turnId)
+    ) {
+      // The provider sent this frame after its turn already reached a
+      // terminal state. The queue now stays open across turns, so a silent
+      // drop here would let a stale frame reach the next turn's consumer.
+      // Report it instead of discarding it without a trace.
+      this.#emit("harness.diagnostic", {
+        code: "opencode_late_terminal_turn_event_dropped",
+        message: `OpenCode sent a ${eventType} event for a turn that already reached a terminal state.`,
+        droppedEventType: eventType,
+        turnId: refs.turnId,
+      });
+      return;
+    }
     const sourceSeq = ++this.#sourceSequence;
     const event: PrpEvent = {
       schema: "paperclip.prp.event.v1",

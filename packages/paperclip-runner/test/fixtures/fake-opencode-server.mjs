@@ -108,8 +108,18 @@ function json(response, status, value) {
   response.end(JSON.stringify(value));
 }
 
+// Each simulated turn reuses the same short event ids ("event-1",
+// "event-3", and so on). OpenCode's real event ids are unique, and the
+// driver relies on that to drop a duplicate delivery of the same event.
+// Scope every event id to the turn that produced it so a second turn's
+// events do not look like duplicates of the first turn's events.
+let promptTurnSeq = 0;
 function emit(value) {
-  const frame = `data: ${JSON.stringify(value)}\n\n`;
+  const scoped =
+    promptTurnSeq > 0 && typeof value.id === "string"
+      ? { ...value, id: `${value.id}#${promptTurnSeq}` }
+      : value;
+  const frame = `data: ${JSON.stringify(scoped)}\n\n`;
   for (const response of clients) response.write(frame);
 }
 
@@ -381,6 +391,7 @@ const server = createServer(async (request, response) => {
           error: "OpenCode 1.18 prompt model fields must be top-level",
         });
       }
+      promptTurnSeq += 1;
       json(response, 204, null);
       setTimeout(async () => {
         await callFirstPaperclipTool();
@@ -425,6 +436,20 @@ const server = createServer(async (request, response) => {
               error: {
                 name: "MessageAbortedError",
                 data: { message: "Aborted" },
+              },
+            },
+          });
+          return;
+        }
+        if (String(parsedPrompt.message ?? "").includes("session-failed")) {
+          emit({
+            type: "session.error",
+            id: "event-session-failed",
+            properties: {
+              sessionID: session.id,
+              error: {
+                name: "ProviderError",
+                message: "The fake provider failed on purpose.",
               },
             },
           });
