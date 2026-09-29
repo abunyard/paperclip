@@ -115,10 +115,14 @@ function json(response, status, value) {
 // events do not look like duplicates of the first turn's events.
 let promptTurnSeq = 0;
 // Set by a "late-straggler-source" turn to simulate a distinct provider
-// frame for that turn's message arriving only after the next turn's prompt
-// has already been accepted. Flushed at the very start of the next prompt
-// request, after the driver has already moved its active turn forward.
-let lateStragglerPending = false;
+// frame for that turn's message arriving only after a later turn's prompt
+// has already been accepted. Counts down by one on each subsequent prompt
+// request and flushes at the start of the request that brings it to zero.
+// A plain "late-straggler-source" message flushes on the very next prompt
+// (delay 1); "late-straggler-source-delay-N" flushes N prompts later, so a
+// test can place the stale frame's arrival after several more turns have
+// sealed.
+let lateStragglerRemaining = 0;
 function emit(value) {
   const scoped =
     promptTurnSeq > 0 && typeof value.id === "string"
@@ -398,22 +402,24 @@ const server = createServer(async (request, response) => {
       }
       promptTurnSeq += 1;
       json(response, 204, null);
-      if (lateStragglerPending) {
-        lateStragglerPending = false;
-        emit({
-          type: "message.part.updated",
-          id: "event-late-straggler-delivery",
-          properties: {
-            sessionID: session.id,
-            part: {
-              id: "part-late-straggler",
-              messageID: "message-late-source",
-              type: "text",
-              text: "late straggler text must not reach the next turn",
-              time: { start: 9, end: 10 },
+      if (lateStragglerRemaining > 0) {
+        lateStragglerRemaining -= 1;
+        if (lateStragglerRemaining === 0) {
+          emit({
+            type: "message.part.updated",
+            id: "event-late-straggler-delivery",
+            properties: {
+              sessionID: session.id,
+              part: {
+                id: "part-late-straggler",
+                messageID: "message-late-source",
+                type: "text",
+                text: "late straggler text must not reach the next turn",
+                time: { start: 9, end: 10 },
+              },
             },
-          },
-        });
+          });
+        }
       }
       setTimeout(async () => {
         await callFirstPaperclipTool();
@@ -525,9 +531,13 @@ const server = createServer(async (request, response) => {
             id: "event-late-source-idle",
             properties: { sessionID: session.id },
           });
-          // Deliver the straggling frame for this message only once the
-          // next turn's own prompt has already been accepted.
-          lateStragglerPending = true;
+          // Deliver the straggling frame for this message only once a later
+          // turn's own prompt has already been accepted. Defaults to the
+          // very next prompt; "-delay-N" postpones it by N prompts.
+          const delayMatch = String(parsedPrompt.message ?? "").match(
+            /late-straggler-source-delay-(\d+)/,
+          );
+          lateStragglerRemaining = delayMatch ? Number(delayMatch[1]) : 1;
           return;
         }
         const textBeforeFinish = String(parsedPrompt.message ?? "").includes(
