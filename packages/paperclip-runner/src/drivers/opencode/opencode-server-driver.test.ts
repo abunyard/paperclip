@@ -952,13 +952,13 @@ describe("OpenCodeServerDriver", () => {
     await session.close({ reason: "test" });
   });
 
-  it("bounds the sealed-turn gate so old turns stop blocking once newer turns evict them", async () => {
+  it("keeps rejecting a late frame for a sealed turn no matter how many later turns have already sealed", async () => {
     await chmod(fixture, 0o755);
     const root = await mkdtemp(
-      join(tmpdir(), "paperclip-opencode-sealed-bound-"),
+      join(tmpdir(), "paperclip-opencode-sealed-many-turns-"),
     );
     const workspace = await mkdtemp(
-      join(tmpdir(), "paperclip-opencode-sealed-bound-workspace-"),
+      join(tmpdir(), "paperclip-opencode-sealed-many-turns-workspace-"),
     );
     roots.push(root, workspace);
     const driver = new OpenCodeServerDriver({
@@ -969,51 +969,55 @@ describe("OpenCodeServerDriver", () => {
         PATH: process.env.PATH,
         OPENROUTER_API_KEY: "fixture-key",
       },
-      // A small bound lets this test reach eviction in a few turns instead
-      // of running past the production default.
-      maxSealedTurnIds: 2,
     });
     const session = await driver.openSession({
-      runId: "run-sealed-bound",
-      normalizedSessionId: "sealed-bound",
+      runId: "run-sealed-many-turns",
+      normalizedSessionId: "sealed-many-turns",
       workingDirectory: workspace,
     });
 
-    // Turn A schedules its own late frame to arrive three prompts later, so
-    // it lands only after two more turns have sealed.
+    // Turn A schedules its own late frame to arrive four prompts later, so
+    // it lands only after three more turns have sealed. The late-frame gate
+    // in `#emit` compares directly against the current active turn, not a
+    // bounded history, so it must still reject this frame no matter how
+    // many turns sealed in between.
     const turnA = await session.startTurn({
-      message: { role: "user", text: "late-straggler-source-delay-3" },
+      message: { role: "user", text: "late-straggler-source-delay-4" },
     });
     await collectTurnEvents(session.events());
 
-    // Turn B seals second, filling the bound of two (turn A, turn B).
-    await session.startTurn({ message: { role: "user", text: "finish" } });
-    await collectTurnEvents(session.events());
+    for (let index = 0; index < 3; index += 1) {
+      await session.startTurn({ message: { role: "user", text: "finish" } });
+      await collectTurnEvents(session.events());
+    }
 
-    // Turn C seals third. The bound is already full, so sealing turn C
-    // evicts turn A, the oldest entry.
-    await session.startTurn({ message: { role: "user", text: "finish" } });
-    await collectTurnEvents(session.events());
-
-    // Turn D's prompt request is what finally delivers turn A's scheduled
-    // late frame. Turn A's id is no longer in the bounded set, so the gate
-    // in `#emit` no longer drops it.
-    const turnD = await session.startTurn({
+    // This turn's prompt request is what finally delivers turn A's scheduled
+    // late frame, well after turn A's own turn sealed.
+    const turnE = await session.startTurn({
       message: { role: "user", text: "finish" },
     });
-    const turnDEvents = await collectTurnEvents(session.events());
+    const turnEEvents = await collectTurnEvents(session.events());
 
     expect(
-      turnDEvents.some(
-        (event) => event.eventType === "harness.diagnostic",
+      turnEEvents.some((event) =>
+        JSON.stringify(event.payload).includes(
+          "late straggler text must not reach the next turn",
+        ),
       ),
     ).toBe(false);
-    expect(turnDEvents.some((event) => event.turnId === turnA.turnId)).toBe(
-      true,
+    expect(turnEEvents.some((event) => event.turnId === turnA.turnId)).toBe(
+      false,
     );
     expect(
-      turnDEvents.filter((event) => event.eventType === "turn.completed"),
-    ).toMatchObject([{ turnId: turnD.turnId }]);
+      turnEEvents.find((event) => event.eventType === "harness.diagnostic")
+        ?.payload,
+    ).toMatchObject({
+      code: "opencode_late_terminal_turn_event_dropped",
+      turnId: turnA.turnId,
+    });
+    expect(
+      turnEEvents.filter((event) => event.eventType === "turn.completed"),
+    ).toMatchObject([{ turnId: turnE.turnId }]);
 
     await session.close({ reason: "test" });
   });

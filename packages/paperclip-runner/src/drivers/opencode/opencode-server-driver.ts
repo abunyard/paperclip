@@ -77,13 +77,6 @@ export const QUALIFIED_OPENCODE_VERSION = "1.18.32" as const;
 export const QUALIFIED_OPENCODE_MODEL =
   "openrouter/deepseek/deepseek-v4-flash-0731" as const;
 
-// Default cap on `#sealedTurnIds` (see that field for the reason it needs a
-// bound). A reusable session that runs this many turns without the process
-// restarting is far past the point where a provider frame for an early turn
-// could still be in flight, so eviction at this size does not weaken the
-// late-frame gate for any turn that is actually still able to straggle in.
-const DEFAULT_MAX_SEALED_TURN_IDS = 500;
-
 type DynamicToolHandler = (call: {
   tool: string;
   callId: string;
@@ -122,8 +115,6 @@ export interface OpenCodeServerDriverOptions {
   onDiagnostic?: (message: string) => void;
   fetch?: typeof globalThis.fetch;
   now?: () => Date;
-  /** Test-only override for the sealed-turn bound; production leaves this unset. */
-  maxSealedTurnIds?: number;
 }
 
 interface OpenCodeRuntime {
@@ -354,8 +345,6 @@ export class OpenCodeServerDriver implements HarnessDriver {
           dynamicToolHandler: this.#options.dynamicToolHandler,
           snapshot,
           now: this.#options.now ?? (() => new Date()),
-          maxSealedTurnIds:
-            this.#options.maxSealedTurnIds ?? DEFAULT_MAX_SEALED_TURN_IDS,
         });
         session.startEventPump();
         return session;
@@ -394,18 +383,6 @@ class OpenCodeHarnessSession implements HarnessSession {
   readonly #events = new AsyncQueue<PrpEvent>();
   readonly #transcript: PrpEvent[] = [];
   readonly #terminalTurns = new Map<string, string>();
-  // Turns whose terminal event has already reached the queue. Unlike
-  // `#terminalTurns`, `attachRun` never clears this set: a turn id is never
-  // reused, so a late provider frame for a sealed turn must stay blocked for
-  // the rest of the session, even after a new turn attaches. A long-lived
-  // reusable session can run many turns, so the set is bounded at
-  // `#maxSealedTurnIds`. `#sealTurn` evicts the oldest entry first (FIFO by
-  // insertion order) once the set is full. A provider frame that arrives
-  // late enough to target an evicted turn no longer hits the gate, but a
-  // frame that late is not a real risk: many newer turns have already
-  // sealed by the time eviction reaches that old an entry.
-  readonly #sealedTurnIds = new Set<string>();
-  readonly #maxSealedTurnIds: number;
   readonly #seenProviderEvents = new Set<string>();
   // The turn that created each native message. A raw OpenCode frame carries
   // no turn identity of its own, so this map — not the mutable active-turn
@@ -473,7 +450,6 @@ class OpenCodeHarnessSession implements HarnessSession {
     dynamicToolHandler?: DynamicToolHandler;
     snapshot: PersistedHarnessSession | null;
     now: () => Date;
-    maxSealedTurnIds: number;
   }) {
     this.#runtime = input.runtime;
     this.#fetch = input.fetcher;
@@ -489,7 +465,6 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#systemInstructions = input.systemInstructions;
     this.#dynamicToolHandler = input.dynamicToolHandler;
     this.#now = input.now;
-    this.#maxSealedTurnIds = Math.max(1, input.maxSealedTurnIds);
     this.#sendFullContext = input.snapshot === null && this.#conversationMode !== "prepared";
     this.#sourceSequence = input.snapshot?.lastSourceSequence ?? 0;
     this.#activeTurnId = input.snapshot?.activeTurnId ?? null;
@@ -500,7 +475,6 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#resultTurnId = restored?.turnId ?? null;
     for (const terminal of input.snapshot?.terminalTurns ?? []) {
       this.#terminalTurns.set(terminal.turnId, terminal.fingerprint);
-      this.#sealTurn(terminal.turnId);
     }
     if (this.#activeTurnId && this.#terminalTurns.has(this.#activeTurnId)) {
       this.#activeTurnId = null;
@@ -557,9 +531,9 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#completedReasoningPartIds.clear();
     this.#completedTextParts.length = 0;
     // `#terminalTurns` clears here for its own persisted-snapshot bookkeeping.
-    // `#sealedTurnIds` does not clear: it is the event-queue gate, and a turn
-    // id is never reused, so a late frame for the just-finished turn must
-    // stay blocked even after this new run attaches.
+    // The late-frame gate in `#emit` does not depend on this map: it compares
+    // against `#activeTurnId` directly, so a frame for the just-finished turn
+    // stays blocked even after this new run attaches (see `#emit`).
     this.#terminalTurns.clear();
     this.#sendFullContext = false;
     this.#emit("run.attached", { runId: input.runId, sameSession: true });
@@ -1534,11 +1508,11 @@ class OpenCodeHarnessSession implements HarnessSession {
           { ...workspace, complete: true },
           { turnId, itemId: `${turnId}:workspace` },
         );
-      this.#activeTurnId = null;
+      // Emit while this turn is still `#activeTurnId`; the gate in `#emit`
+      // drops any frame whose turnId is not the active turn, so nulling it
+      // first would make `#emit` drop this very event.
       this.#emit("turn.completed", { status: "completed" }, { turnId });
-      // Seal only after the terminal event itself has gone through the gate
-      // in `#emit`; sealing first would make `#emit` drop this very event.
-      this.#sealTurn(turnId);
+      this.#activeTurnId = null;
       return;
     }
     if (type === "session.error" && turnId) {
@@ -1556,7 +1530,6 @@ class OpenCodeHarnessSession implements HarnessSession {
         // card. Preserve the provider fact as a cancelled terminal event; the
         // native session loop independently commits the authoritative yielded
         // result when this abort followed a governed wait.
-        this.#activeTurnId = null;
         this.#emit(
           "turn.cancelled",
           {
@@ -1566,7 +1539,7 @@ class OpenCodeHarnessSession implements HarnessSession {
           { turnId },
         );
         this.#terminalTurns.set(turnId, canonicalJson({ status: "cancelled" }));
-        this.#sealTurn(turnId);
+        this.#activeTurnId = null;
         return;
       }
       this.#emit(
@@ -1586,26 +1559,14 @@ class OpenCodeHarnessSession implements HarnessSession {
         },
         { turnId, itemId: `${turnId}:session-error` },
       );
-      this.#activeTurnId = null;
       this.#emit(
         "turn.failed",
         { status: "failed", error: bounded(properties.error ?? properties) },
         { turnId },
       );
       this.#terminalTurns.set(turnId, canonicalJson({ status: "failed" }));
-      this.#sealTurn(turnId);
+      this.#activeTurnId = null;
     }
-  }
-
-  // Add a turn to the late-frame gate and enforce `#maxSealedTurnIds`. When
-  // the set is full, evict the oldest entry (FIFO by insertion order) before
-  // adding the new one, so the set never grows past its bound.
-  #sealTurn(turnId: string): void {
-    if (this.#sealedTurnIds.size >= this.#maxSealedTurnIds) {
-      const oldest = this.#sealedTurnIds.values().next().value;
-      if (oldest !== undefined) this.#sealedTurnIds.delete(oldest);
-    }
-    this.#sealedTurnIds.add(turnId);
   }
 
   #emitAssistantPart(part: Record<string, unknown>, turnId: string): void {
@@ -1872,12 +1833,18 @@ class OpenCodeHarnessSession implements HarnessSession {
     if (
       eventType !== "harness.diagnostic" &&
       refs.turnId !== undefined &&
-      this.#sealedTurnIds.has(refs.turnId)
+      refs.turnId !== this.#activeTurnId
     ) {
-      // The provider sent this frame after its turn already reached a
-      // terminal state. The queue now stays open across turns, so a silent
-      // drop here would let a stale frame reach the next turn's consumer.
-      // Report it instead of discarding it without a trace.
+      // The provider sent this frame for a turn that is not the current
+      // active turn, so that turn already reached a terminal state: turns
+      // run strictly one at a time (`startTurn` and `attachRun` both refuse
+      // to proceed while `#activeTurnId` is set), and a turn id is never
+      // reused. Comparing directly against `#activeTurnId` needs no history
+      // of past turns, so the gate stays correct and its memory stays O(1)
+      // no matter how many turns a long-lived session runs. The queue stays
+      // open across turns, so a silent drop here would let a stale frame
+      // reach the next turn's consumer. Report it instead of discarding it
+      // without a trace.
       this.#emit("harness.diagnostic", {
         code: "opencode_late_terminal_turn_event_dropped",
         message: `OpenCode sent a ${eventType} event for a turn that already reached a terminal state.`,
