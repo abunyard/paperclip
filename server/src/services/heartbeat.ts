@@ -24338,7 +24338,14 @@ export function heartbeatService(
         const normalizedUsage = sessionUsageResolution.normalizedUsage;
         const runErrorMessage =
           outcome === "cancelled"
-            ? (latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
+            ? (latestRun?.error ??
+              // L0007: prefer the control-plane abort reason over the adapter's generic text.
+              (executionControl.controller.signal.aborted &&
+              executionControl.controller.signal.reason instanceof Error
+                ? executionControl.controller.signal.reason.message
+                : undefined) ??
+              adapterResult.errorMessage ??
+              "Cancelled")
             : outcome === "succeeded"
               ? null
               : redactCurrentUserText(

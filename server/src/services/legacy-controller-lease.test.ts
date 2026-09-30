@@ -6,6 +6,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { heartbeatService } from "./heartbeat.js";
 import { hasLiveLegacyController, legacyControllerBootId, legacyControllerClaim,
   renewLegacyControllerLease, revokeExpiredLegacyController, watchLegacyControllerLease } from "./legacy-controller-lease.js";
+import { logger } from "../middleware/logger.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("durable legacy controller ownership", () => {
@@ -69,6 +70,29 @@ const support = await getEmbeddedPostgresTestSupport();
       await expect(watch.assertOwned("dispatching")).rejects.toThrow("lease lost");
       expect(controller.signal.aborted).toBe(true);
     } finally { watch.stop(); }
+  });
+  it("L0007: a lost lease logs why, persists the reason, and aborts with it (not a generic Cancelled)", async () => {
+    const run = await seed();
+    await expire(run.id);
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined as never);
+    const controller = new AbortController();
+    const watch = watchLegacyControllerLease(db, run, controller);
+    try {
+      await expect(watch.assertOwned()).rejects.toThrow(/Legacy controller lease lost \(renewal returned no row/);
+      expect((controller.signal.reason as Error).message).toMatch(/^Legacy controller lease lost \(renewal returned no row/);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ event: "legacy_controller_lease_lost", runId: run.id, leaseMs: 60_000, renewMs: 10_000 }),
+        expect.stringContaining("lease lost"),
+      );
+      // Finalization prefers the stored error for cancelled runs; the reason is persisted best-effort.
+      await vi.waitFor(async () => {
+        const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+        expect(saved).toMatchObject({ errorCode: "controller_lease_lost", error: expect.stringContaining("renewal returned no row") });
+      });
+      // A second loss signal after abort is ignored (one log line, first reason kept).
+      await expect(watch.assertOwned()).rejects.toThrow();
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally { watch.stop(); warn.mockRestore(); }
   });
   it("only one competing recovery revokes the observed expired owner", async () => {
     const run = await seed();

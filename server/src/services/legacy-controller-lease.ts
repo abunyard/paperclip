@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, gt, lte, sql } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { logger } from "../middleware/logger.js";
 
 // A boot UUID has meaning across containers; a numeric PID does not.
 export const legacyControllerBootId = randomUUID();
@@ -70,8 +71,33 @@ export function watchLegacyControllerLease(db: Db, run: Run, controller: AbortCo
   }
   let stopped = false;
   let pending = false;
-  const lost = () => { if (!stopped) controller.abort(new Error("Legacy controller lease lost")); };
-  let deadline = setTimeout(lost, Math.max(0,
+  let lastRenewedAt = Date.now();
+  // L0007: record WHY the controller aborts. Without this the run ends as a generic
+  // adapter "Cancelled" (errorCode "cancelled") and the lease loss is invisible.
+  const lost = (cause: unknown = "deadline") => {
+    if (stopped || controller.signal.aborted) return;
+    const causeText = cause instanceof Error ? cause.message : String(cause);
+    const reason = `Legacy controller lease lost (${causeText})`;
+    logger.warn({
+      event: "legacy_controller_lease_lost",
+      runId: run.id,
+      companyId: run.companyId,
+      cause: causeText,
+      renewalPending: pending,
+      msSinceLastRenewal: Date.now() - lastRenewedAt,
+      leaseMs: LEGACY_CONTROLLER_LEASE_MS,
+      renewMs: LEGACY_CONTROLLER_RENEW_MS,
+    }, "legacy controller lease lost; aborting adapter");
+    // Best effort: persist the reason so run finalization (which prefers the stored
+    // error/errorCode for cancelled runs) reports it instead of the adapter's "Cancelled".
+    // Deferred and fully guarded: a hung or failing DB must never delay or break the abort below.
+    void Promise.resolve()
+      .then(() => db.update(heartbeatRuns).set({ error: reason, errorCode: "controller_lease_lost", updatedAt: new Date() })
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running"))))
+      .catch(() => undefined);
+    controller.abort(new Error(reason));
+  };
+  let deadline = setTimeout(() => lost("initial lease deadline"), Math.max(0,
     (run.controllerLeaseExpiresAt?.getTime() ?? 0) - Date.now()));
   deadline.unref();
   const assertOwned = async (stage?: "dispatching") => {
@@ -91,20 +117,21 @@ export function watchLegacyControllerLease(db: Db, run: Run, controller: AbortCo
     }
     if (stopped) return;
     if (!renewed) {
-      lost();
+      lost("renewal returned no row (lease expired or taken over)");
       controller.signal.throwIfAborted();
     }
     controller.signal.throwIfAborted();
+    lastRenewedAt = Date.now();
     if (!stopped) {
       clearTimeout(deadline);
-      deadline = setTimeout(lost, Math.max(0, LEGACY_CONTROLLER_LEASE_MS - (Date.now() - startedAt)));
+      deadline = setTimeout(() => lost("renewal deadline (no successful renewal within lease)"), Math.max(0, LEGACY_CONTROLLER_LEASE_MS - (Date.now() - startedAt)));
       deadline.unref();
     }
   };
   const timer = setInterval(() => {
     if (pending || stopped) return;
     pending = true;
-    void assertOwned().catch(lost).finally(() => { pending = false; });
+    void assertOwned().catch((err) => lost(err ?? "renewal error")).finally(() => { pending = false; });
   }, LEGACY_CONTROLLER_RENEW_MS);
   timer.unref();
   return { assertOwned, stop() { stopped = true; clearInterval(timer); clearTimeout(deadline); } };
