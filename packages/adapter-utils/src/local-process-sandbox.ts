@@ -29,6 +29,8 @@ export interface LocalProcessSandboxOptions {
   networkAllowlist?: string[];
   networkTrustedUrls?: string[];
   command?: string;
+  /** Test seam for the /bin, /sbin, /lib, /lib64 layout probe (wabnet L0010). */
+  rootSystemPathProbe?: (candidate: string) => Promise<RootSystemPathKind>;
 }
 
 export interface LocalProcessSandboxSpawnTarget {
@@ -48,12 +50,46 @@ interface NetworkAllowlistProxy {
   close: () => Promise<void>;
 }
 
+// Top-level paths that merged-/usr distros (Ubuntu >= 20.04, Debian >= 12, Fedora, Arch)
+// ship as symlinks into /usr, and older layouts ship as real directories.
+export const ROOT_SYSTEM_LINK_PATHS = ["/bin", "/sbin", "/lib", "/lib64"] as const;
+
+export type RootSystemPathKind =
+  | { kind: "symlink"; target: string }
+  | { kind: "directory" }
+  | { kind: "missing" };
+
+async function probeRootSystemPath(candidate: string): Promise<RootSystemPathKind> {
+  const stat = await fs.lstat(candidate).catch(() => null);
+  if (!stat) return { kind: "missing" };
+  if (stat.isSymbolicLink()) return { kind: "symlink", target: await fs.readlink(candidate) };
+  return { kind: "directory" };
+}
+
+/**
+ * wabnet L0010: mirror the host's layout for /bin, /sbin, /lib and /lib64 instead of
+ * unconditionally creating `--symlink usr/X /X` and then ALSO `--ro-bind`ing the host
+ * path onto it. On merged-/usr hosts the host path is a symlink, bwrap resolves the
+ * bind source to /oldroot/usr/X, and binding it onto the new-root symlink (whose
+ * target /usr is not mounted yet) fails: "Can't bind mount /oldroot/usr/bin on
+ * /newroot/bin: No such file or directory". A symlink stays a symlink (same target);
+ * a real directory is bind-mounted read-only; a missing path is left out.
+ */
+export async function rootSystemPathArgs(
+  probe: (candidate: string) => Promise<RootSystemPathKind> = probeRootSystemPath,
+): Promise<{ args: string[]; bindDirectories: string[] }> {
+  const args: string[] = [];
+  const bindDirectories: string[] = [];
+  for (const candidate of ROOT_SYSTEM_LINK_PATHS) {
+    const entry = await probe(candidate);
+    if (entry.kind === "symlink") args.push("--symlink", entry.target, candidate);
+    else if (entry.kind === "directory") bindDirectories.push(candidate);
+  }
+  return { args, bindDirectories };
+}
+
 const SYSTEM_READ_PATHS = [
-  "/bin",
-  "/sbin",
   "/usr",
-  "/lib",
-  "/lib64",
   "/etc/ca-certificates",
   "/etc/ssl",
   "/etc/resolv.conf",
@@ -386,12 +422,8 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
 
   if (filesystemScope === "workspace") {
     args.push("--tmpfs", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp");
-    args.push(
-      "--symlink", "usr/bin", "/bin",
-      "--symlink", "usr/sbin", "/sbin",
-      "--symlink", "usr/lib", "/lib",
-      "--symlink", "usr/lib64", "/lib64",
-    );
+    const rootLayout = await rootSystemPathArgs(input.options.rootSystemPathProbe);
+    args.push(...rootLayout.args);
     const created = new Set<string>(["/", "/proc", "/dev", "/tmp"]);
     const mounted = new Set<string>();
     const mount = async (source: string, access: LocalProcessSandboxAccess) => {
@@ -402,6 +434,9 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
       mounted.add(normalized);
       created.add(normalized);
     };
+    // /usr first, then real (non-merged) top-level directories, then the rest.
+    await mount("/usr", "ro");
+    for (const directory of rootLayout.bindDirectories) await mount(directory, "ro");
     for (const systemPath of SYSTEM_READ_PATHS) await mount(systemPath, "ro");
     for (const executablePath of await executableReadPaths(input.executable)) await mount(executablePath, "ro");
     if (networkScope === "allowlist") {
