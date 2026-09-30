@@ -149,6 +149,11 @@ export const agentsApi = {
     api.patch<Agent>(agentPath(id, companyId), data),
   updatePermissions: (id: string, data: AgentPermissionUpdate, companyId?: string) =>
     api.patch<AgentDetail>(agentPath(id, companyId, "/permissions"), data),
+  // wabnet L0011: principal permission grants on an existing agent (board, users:manage_permissions).
+  grants: (id: string, companyId?: string) =>
+    api.get<{ agentId: string; grants: Array<{ permissionKey: string; scope: Record<string, unknown> | null }> }>(agentPath(id, companyId, "/grants")),
+  setGrants: (id: string, data: { grants: Array<{ permissionKey: string; scope?: Record<string, unknown> | null }>; replace?: boolean }, companyId?: string) =>
+    api.put<{ agentId: string; grants: Array<{ permissionKey: string; scope: Record<string, unknown> | null }> }>(agentPath(id, companyId, "/grants"), data),
   instructionsBundle: (id: string, companyId?: string) =>
     api.get<AgentInstructionsBundle>(agentPath(id, companyId, "/instructions-bundle")),
   updateInstructionsBundle: (

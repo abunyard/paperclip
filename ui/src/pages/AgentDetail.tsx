@@ -31,6 +31,7 @@ import { PillGuy } from "../components/onboarding/PillGuy";
 import { getAdapterDisplay } from "../adapters/adapter-display-registry";
 import { adapterLabels, roleLabels, help } from "../components/agent-config-primitives";
 import { ToggleSwitch } from "@/components/ui/toggle-switch";
+import { AgentGrantsSection } from "@/components/AgentGrantsSection";
 import { useAdapterCapabilities } from "@/adapters/use-adapter-capabilities";
 import { redactCommandText as redactCommandSecretText } from "@paperclipai/adapter-utils";
 import { MarkdownEditor } from "../components/MarkdownEditor";
@@ -2166,6 +2167,7 @@ export function ConfigurationTab({
           </div>
         </div>
       </div> : null}
+      {content === "permissions" ? <AgentGrantsSection agentId={agent.id} companyId={companyId} /> : null}
     </div>
   );
 }
