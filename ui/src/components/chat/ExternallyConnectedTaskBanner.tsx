@@ -31,6 +31,7 @@ import {
   type BoardSendRejection,
   type RetainedBoardSend,
 } from "./board-send-draft";
+import { randomUuidOrFallback } from "../../lib/random-uuid";
 
 const providerNames: Record<ChatProvider, string> = {
   slack: "Slack",
@@ -851,7 +852,7 @@ function ConnectedTaskComposer({
                   retainedScopeKey.current !== storageKey
                 )
                   return;
-                idempotencyKey.current ??= crypto.randomUUID();
+                idempotencyKey.current ??= randomUuidOrFallback();
                 const input = retainedSend.current ?? {
                   attachmentIds: selectedAttachmentIds,
                   attachmentNames: selectedAttachmentIds.map((id) => ({

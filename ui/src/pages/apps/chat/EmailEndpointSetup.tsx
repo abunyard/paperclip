@@ -42,6 +42,7 @@ import type {
   AgentPermissions,
   EmailEndpointSummary,
 } from "@paperclipai/shared";
+import { randomUuidOrFallback } from "../../../lib/random-uuid";
 const selectClass =
   "w-full rounded-md border border-input bg-background px-3 py-2 text-sm";
 
@@ -66,7 +67,7 @@ export function EmailEndpointSetup() {
     new Set(params.get("agentId") ? [params.get("agentId")!] : []),
   );
   const [apiKey, setApiKey] = useState("");
-  const [requestId] = useState(() => crypto.randomUUID());
+  const [requestId] = useState(() => randomUuidOrFallback());
   const [addressMode, setAddressMode] = useState("new");
   const [inboxId, setInboxId] = useState("");
   const [username, setUsername] = useState("");
