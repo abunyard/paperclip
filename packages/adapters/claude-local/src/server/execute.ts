@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
@@ -163,6 +164,27 @@ function isBedrockAuth(env: Record<string, string>): boolean {
     env.CLAUDE_CODE_USE_BEDROCK === "true" ||
     hasNonEmptyEnvValue(env, "ANTHROPIC_BEDROCK_BASE_URL")
   );
+}
+
+// wabnet L0012: `filesystemPnpmStore: true` shares the host's default pnpm store and metadata
+// cache read-only; an object `{ storeDir, cacheDir }` names them explicitly.
+function resolveSandboxPnpmStore(value: unknown): { storeDir: string; cacheDir: string | null } | null {
+  if (value === true) {
+    const home = os.homedir();
+    const dataHome = process.env.XDG_DATA_HOME?.trim() || path.join(home, ".local", "share");
+    const cacheHome = process.env.XDG_CACHE_HOME?.trim() || path.join(home, ".cache");
+    return { storeDir: path.join(dataHome, "pnpm", "store"), cacheDir: path.join(cacheHome, "pnpm") };
+  }
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    if (typeof record.storeDir === "string" && path.isAbsolute(record.storeDir)) {
+      return {
+        storeDir: record.storeDir,
+        cacheDir: typeof record.cacheDir === "string" && path.isAbsolute(record.cacheDir) ? record.cacheDir : null,
+      };
+    }
+  }
+  return null;
 }
 
 async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<ClaudeRuntimeConfig> {
@@ -588,6 +610,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
           postWorkspacePaths: gitSandboxPlan?.paths ?? [],
           bindSyslog: config.filesystemBindSyslog === true,
+          pnpmStore: resolveSandboxPnpmStore(config.filesystemPnpmStore),
           homeDir: filesystemScope ? path.dirname(sharedClaudeConfigDir) : null,
           networkScope,
           networkAllowlist: parseLocalProcessNetworkAllowlist(config.networkAllowlist),

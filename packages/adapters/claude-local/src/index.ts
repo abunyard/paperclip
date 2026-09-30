@@ -62,6 +62,7 @@ Core fields:
 - filesystemScope (string, optional): set to "workspace" to confine local CLI filesystem access with Bubblewrap. Off by default. The workspace and Claude config remain writable; other host paths are hidden.
 - filesystemExtraPaths (array, optional): additional absolute host paths exposed inside the workspace sandbox. String entries are read-only; object entries use { path: "/absolute/path", access: "ro" | "rw" }.
 - filesystemSandboxCommand (string, optional): Bubblewrap executable name or absolute path; defaults to "bwrap". Linux only.
+- filesystemPnpmStore (boolean | { storeDir, cacheDir }, optional): with filesystemScope "workspace", let pnpm inside the sandbox install from the host pnpm store without write access to it (shared files and metadata cache read-only, a private per-run copy of the store index, offline + frozen store).
 - filesystemBindSyslog (boolean, optional): with filesystemScope "workspace", bind the host syslog socket at /dev/log (read-write) so hooks inside the sandbox can log. Off by default; it lets the sandboxed process write arbitrary syslog lines.
 - networkScope (string, optional): "deny" blocks all network egress; "allowlist" permits only networkAllowlist targets through Paperclip's HTTP(S) proxy. Off by default.
 - networkAllowlist (string[], optional): exact hostnames, hostname:port entries, or origin URLs. Include the configured Claude provider origin, such as "api.anthropic.com", Bedrock/Vertex endpoints, or a custom gateway.

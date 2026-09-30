@@ -40,6 +40,15 @@ export interface LocalProcessSandboxOptions {
    * Opt-in: it lets the sandboxed process write arbitrary syslog lines.
    */
   bindSyslog?: boolean;
+  /**
+   * wabnet L0012: let `pnpm install` inside the sandbox use the host pnpm store WITHOUT write
+   * access to it. The shared content (`<store>/vN/files`) and metadata cache are bound
+   * read-only; each run gets a private store root holding a COPY of the store's SQLite index
+   * (SQLite cannot open a read-only mount) and a symlink to the read-only `files`. pnpm runs
+   * offline with a frozen store, so a missing package fails fast instead of hanging on the
+   * (blocked) registry.
+   */
+  pnpmStore?: { storeDir: string; cacheDir?: string | null } | null;
   /** Test seam for the /bin, /sbin, /lib, /lib64 layout probe (wabnet L0010). */
   rootSystemPathProbe?: (candidate: string) => Promise<RootSystemPathKind>;
 }
@@ -385,6 +394,51 @@ server.listen(${SANDBOX_PROXY_PORT}, "127.0.0.1", () => {
   return source.trimStart();
 }
 
+/**
+ * wabnet L0012: build a per-run private pnpm store root. Returns null when the host store has
+ * no `vN/` layout to share. Never writes to the host store.
+ */
+export async function preparePnpmStoreSandbox(options: { storeDir: string; cacheDir?: string | null }): Promise<{
+  privateStoreDir: string;
+  readOnlyPaths: string[];
+  env: Record<string, string>;
+} | null> {
+  const storeDir = normalizeAbsolutePath(options.storeDir, "pnpmStore.storeDir");
+  const entries = await fs.readdir(storeDir, { withFileTypes: true }).catch(() => []);
+  const versions = entries.filter((entry) => entry.isDirectory() && /^v\d+$/.test(entry.name)).map((entry) => entry.name);
+  if (versions.length === 0) return null;
+  const privateStoreDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pnpm-store-"));
+  const readOnlyPaths: string[] = [];
+  try {
+    for (const version of versions) {
+      const hostVersionDir = path.join(storeDir, version);
+      const privateVersionDir = path.join(privateStoreDir, version);
+      await fs.mkdir(privateVersionDir, { recursive: true });
+      const hostIndex = path.join(hostVersionDir, "index.db");
+      if (await pathExists(hostIndex)) await fs.copyFile(hostIndex, path.join(privateVersionDir, "index.db"));
+      const hostFiles = path.join(hostVersionDir, "files");
+      if (await pathExists(hostFiles)) {
+        await fs.symlink(hostFiles, path.join(privateVersionDir, "files"));
+        readOnlyPaths.push(hostFiles);
+      }
+    }
+  } catch (error) {
+    await fs.rm(privateStoreDir, { recursive: true, force: true });
+    throw error;
+  }
+  const env: Record<string, string> = {
+    pnpm_config_store_dir: privateStoreDir,
+    pnpm_config_offline: "true",
+    pnpm_config_frozen_store: "true",
+  };
+  const cacheDir = options.cacheDir ? normalizeAbsolutePath(options.cacheDir, "pnpmStore.cacheDir") : null;
+  if (cacheDir && (await pathExists(cacheDir))) {
+    readOnlyPaths.push(cacheDir);
+    env.pnpm_config_cache_dir = cacheDir;
+  }
+  return { privateStoreDir, readOnlyPaths, env };
+}
+
 export async function buildLocalProcessSandboxSpawnTarget(input: {
   executable: string;
   args: string[];
@@ -457,6 +511,18 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
     for (const extraPath of input.options.extraPaths ?? []) await mount(extraPath.path, extraPath.access);
     await mount(workspaceDir, "rw");
     for (const overlay of input.options.postWorkspacePaths ?? []) await mount(overlay.path, overlay.access);
+    if (input.options.pnpmStore) {
+      const prepared = await preparePnpmStoreSandbox(input.options.pnpmStore);
+      if (prepared) {
+        for (const shared of prepared.readOnlyPaths) await mount(shared, "ro");
+        await mount(prepared.privateStoreDir, "rw");
+        Object.assign(env, prepared.env);
+        const previous = cleanup;
+        cleanup = async () => {
+          try { await previous?.(); } finally { await fs.rm(prepared.privateStoreDir, { recursive: true, force: true }); }
+        };
+      }
+    }
     if (input.options.bindSyslog) {
       const socket = await fs.realpath("/dev/log").catch(() => null);
       if (socket) args.push("--bind", socket, "/dev/log");
@@ -494,9 +560,14 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
       await mount(tempDir, "rw");
       executable = process.execPath;
       executableArgs = [bridgePath, socketPath, input.executable, ...input.args];
+      const earlierCleanup = cleanup;
       cleanup = async () => {
-        await proxy.close();
-        await fs.rm(tempDir, { recursive: true, force: true });
+        try {
+          await proxy.close();
+          await fs.rm(tempDir, { recursive: true, force: true });
+        } finally {
+          await earlierCleanup?.();
+        }
       };
     }
   } else {
