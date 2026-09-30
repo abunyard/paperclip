@@ -119,6 +119,7 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
       },
       result: { version: 1, outcome: "accepted" },
       resolvedByUserId: "board-user",
+      addresseeUserId: "board-user",
       resolvedAt: new Date(),
     });
 
@@ -153,6 +154,7 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
       },
       result: { version: 1, outcome: "accepted" },
       resolvedByUserId: "board-user",
+      addresseeUserId: "board-user",
       resolvedAt: new Date(),
     });
     const actorRunId = randomUUID();
@@ -196,6 +198,7 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
       },
       result: { version: 1, outcome: "accepted" },
       resolvedByUserId: "board-user",
+      addresseeUserId: "board-user",
       resolvedAt: new Date(),
     });
 
@@ -217,6 +220,35 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
     });
   });
 
+  it.each([
+    ["accepted by a board user other than the addressee", { addresseeUserId: "board-user", resolvedByUserId: "other-board-user" }],
+    ["accepted with no addressee at all", { addresseeUserId: null, resolvedByUserId: "board-user" }],
+  ])("L0011: refuses a consent %s", async (_label, who) => {
+    const { companyId, coachId, sourceRunId, proposalIssueId, targetKey } = await seedGateFixture();
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId: proposalIssueId,
+      kind: "request_confirmation",
+      status: "accepted",
+      continuationPolicy: "wake_assignee_on_accept",
+      sourceRunId,
+      createdByAgentId: coachId,
+      payload: {
+        version: 1,
+        prompt: "Apply this skill diff?",
+        detailsMarkdown: "```diff\n+Tighten the workflow.\n```",
+        target: { type: "custom", key: targetKey, revisionId: "proposal-v1" },
+      },
+      result: { version: 1, outcome: "accepted" },
+      resolvedAt: new Date(),
+      ...who,
+    });
+    await expect(changeConsentGateService(db).assertConsented({
+      companyId, actorAgentId: coachId, actorRunId: randomUUID(), targetKeys: [targetKey],
+    })).rejects.toMatchObject({ status: 403, details: { code: "reflection_coach_mutation_gate_required" } });
+  });
+
   it("allows legacy Reflection Coach target keys for durable accepted interactions", async () => {
     const { companyId, coachId, sourceRunId, proposalIssueId, skillId, targetKey } = await seedGateFixture();
     await db.insert(issueThreadInteractions).values({
@@ -236,6 +268,7 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
       },
       result: { version: 1, outcome: "accepted" },
       resolvedByUserId: "board-user",
+      addresseeUserId: "board-user",
       resolvedAt: new Date(),
     });
 

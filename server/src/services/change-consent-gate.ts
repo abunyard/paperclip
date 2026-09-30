@@ -35,6 +35,19 @@ export function skillsScanProjectsChangeTargetKey() {
   return "skills:scan-projects";
 }
 
+/**
+ * wabnet L0011: true for request_confirmation target keys that gate an agent's
+ * suggest-changes mutation (agents:suggest-changes / skills:suggest-changes), current or legacy.
+ */
+export function isChangeConsentTargetKey(key: unknown): boolean {
+  if (typeof key !== "string" || !key) return false;
+  return /^agent:[^:]+:(profile|instructions)$/.test(key)
+    || /^(skill|skill-slug|skill-import):.+/.test(key)
+    || key === "skills:scan-projects"
+    || /^reflection-coach:(agent-instructions|agent-description|company-skill|company-skill-slug|company-skill-import|company-skill-catalog):.+/.test(key)
+    || key === "reflection-coach:company-skills:scan-projects";
+}
+
 export function touchesAgentProfileChangeConsentFields(patchData: Record<string, unknown>) {
   return AGENT_PROFILE_CHANGE_CONSENT_FIELDS.some((key) =>
     Object.prototype.hasOwnProperty.call(patchData, key),
@@ -150,6 +163,8 @@ export function changeConsentGateService(db: Db) {
           sourceRunId: issueThreadInteractions.sourceRunId,
           payload: issueThreadInteractions.payload,
           result: issueThreadInteractions.result,
+          addresseeUserId: issueThreadInteractions.addresseeUserId,
+          resolvedByUserId: issueThreadInteractions.resolvedByUserId,
         })
         .from(issueThreadInteractions)
         .where(and(
@@ -171,7 +186,10 @@ export function changeConsentGateService(db: Db) {
           && !requestConfirmationResultConsumed(result)
           && payloadHasDisplayedDiff(payload)
           && Boolean(row.sourceRunId)
-          && row.sourceRunId !== actorRunId;
+          && row.sourceRunId !== actorRunId
+          // wabnet L0011: only the addressed human may have accepted it (not "any board user").
+          && Boolean(row.addresseeUserId)
+          && row.resolvedByUserId === row.addresseeUserId;
       });
 
       if (!accepted) {

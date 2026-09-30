@@ -1,4 +1,5 @@
 import { currentContinuationOrigins } from "./execution-continuation.js";
+import { isChangeConsentTargetKey } from "./change-consent-gate.js";
 import { connectionIntentDeliveries } from "@paperclipai/db";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -18,6 +19,7 @@ import {
   agents,
   companySecretProposals,
   companies,
+  companyMemberships,
   documents,
   heartbeatRuns,
   runIdentityContexts,
@@ -125,6 +127,29 @@ import {
 
 export { extractGitHubPullRequestReferences } from "./github-pull-request-merge.js";
 export type { GitHubPullRequestReference } from "./github-pull-request-merge.js";
+
+/**
+ * wabnet L0011: the default human for change-consent confirmations: the company's
+ * defaultResponsibleUserId when it is an active member, else its earliest active owner.
+ */
+async function resolveChangeConsentAddressee(db: Db, companyId: string): Promise<string | null> {
+  const [company] = await db
+    .select({ defaultResponsibleUserId: companies.defaultResponsibleUserId })
+    .from(companies)
+    .where(eq(companies.id, companyId));
+  const owners = await db
+    .select({ principalId: companyMemberships.principalId, membershipRole: companyMemberships.membershipRole })
+    .from(companyMemberships)
+    .where(and(
+      eq(companyMemberships.companyId, companyId),
+      eq(companyMemberships.principalType, "user"),
+      eq(companyMemberships.status, "active"),
+    ))
+    .orderBy(asc(companyMemberships.createdAt));
+  const preferred = company?.defaultResponsibleUserId;
+  if (preferred && owners.some((m) => m.principalId === preferred)) return preferred;
+  return owners.find((m) => m.membershipRole === "owner")?.principalId ?? null;
+}
 
 type InteractionActor = {
   identityContextId?: string | null;
@@ -3319,6 +3344,35 @@ export function issueThreadInteractionService(
         throw unprocessable(
           "An issue-thread interaction cannot address both an agent and a user",
         );
+      }
+
+      // wabnet L0011: an agent's change-consent confirmation (agents:suggest-changes /
+      // skills:suggest-changes) is decided by one named human. Default the addressee to the
+      // company's responsible (owner) user; never address it to an agent.
+      if (
+        normalizedData.kind === "request_confirmation" &&
+        actor.agentId &&
+        isChangeConsentTargetKey(
+          (normalizedData.payload as { target?: { key?: unknown } }).target?.key,
+        )
+      ) {
+        if (normalizedData.addresseeAgentId) {
+          throw unprocessable(
+            "Change-consent confirmations must be addressed to a human user, not an agent",
+            { code: "change_consent_addressee_user_required" },
+          );
+        }
+        if (!normalizedData.addresseeUserId) {
+          const owner = await resolveChangeConsentAddressee(db, issue.companyId);
+          if (!owner) {
+            throw unprocessable(
+              "This company has no owner user to address the change consent to; pass addresseeUserId",
+              { code: "change_consent_addressee_user_required" },
+            );
+          }
+          normalizedData.addresseeUserId = owner;
+          data.addresseeUserId = owner;
+        }
       }
 
       if (normalizedData.addresseeAgentId) {

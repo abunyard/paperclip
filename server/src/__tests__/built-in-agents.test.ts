@@ -1457,6 +1457,8 @@ describeEmbeddedPostgres("built-in agents", () => {
     }, {
       kind: "request_confirmation",
       continuationPolicy: "wake_assignee_on_accept",
+      // wabnet L0011: change-consent confirmations are addressed to one human.
+      addresseeUserId: "board-user",
       title: "Review proposed coaching change",
       summary: "Accept or reject the proposed instruction diff.",
       payload: {
@@ -1515,6 +1517,7 @@ describeEmbeddedPostgres("built-in agents", () => {
     }, {
       kind: "request_confirmation",
       continuationPolicy: "wake_assignee_on_accept",
+      addresseeUserId: "board-user",
       idempotencyKey: "reflection-coach:proposal-v2",
       title: "Review rejected coaching change",
       summary: "Rejecting this diff must not mutate the target instructions.",

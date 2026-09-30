@@ -1,6 +1,7 @@
 import { listOpenRouterModels } from "../services/openrouter-models.js";
 import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings } from "../services/ai-connection-runtime.js";
-import { ADAPTER_AUTH_MISSING_CHECK_CODE, AI_CONNECTION_CAPABILITIES, aiConnectionBindingSchema, type AiConnectionBinding } from "@paperclipai/shared";
+import { ADAPTER_AUTH_MISSING_CHECK_CODE, AI_CONNECTION_CAPABILITIES, PERMISSION_KEYS, aiConnectionBindingSchema, type AiConnectionBinding, type PermissionKey } from "@paperclipai/shared";
+import { z } from "zod";
 import { endpointFromConnectionConfig } from "../services/anthropic-compatible-endpoint.js";
 import { toolConnections } from "@paperclipai/db";
 import { aiConnectionService } from "../services/ai-connections.js";
@@ -455,6 +456,20 @@ export function aiConnectionBindingsEqual(a: unknown, b: unknown): boolean {
   };
   return canonical(a) === canonical(b);
 }
+
+/** wabnet L0011: permissions an agent may never receive via PUT /agents/:id/grants (they confer grants). */
+export const AGENT_GRANT_REFUSED_KEYS = new Set<string>(["users:manage_permissions", "users:invite", "joins:approve"]);
+/** Grants owned by other routes; a `replace` keeps them. */
+const AGENT_GRANT_ROUTE_PRESERVED_KEYS = new Set<string>(["tasks:assign"]);
+const setAgentGrantsSchema = z
+  .object({
+    grants: z.array(z.object({
+      permissionKey: z.enum(PERMISSION_KEYS),
+      scope: z.record(z.string(), z.unknown()).nullable().optional(),
+    }).strict()).max(PERMISSION_KEYS.length),
+    replace: z.boolean().default(false),
+  })
+  .strict();
 
 export function agentRoutes(
   db: Db,
@@ -4936,6 +4951,74 @@ export function agentRoutes(
     });
 
     res.json(await buildAgentDetail(agent));
+  });
+
+  // wabnet L0011: set permission grants on an EXISTING agent. Board users only, with
+  // users:manage_permissions (or instance admin / local trusted). Merges with the agent's
+  // current grants unless `replace: true`. Keys that let an agent confer permissions on
+  // itself or others are refused; tasks:assign stays owned by PATCH /agents/:id/permissions.
+  router.get("/agents/:id/grants", async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
+    if (!existing) return;
+    assertBoard(req);
+    const grants = await access.listPrincipalGrants(existing.companyId, "agent", existing.id);
+    res.json({ agentId: existing.id, grants: grants.map((g) => ({ permissionKey: g.permissionKey, scope: g.scope ?? null })) });
+  });
+
+  router.put("/agents/:id/grants", validate(setAgentGrantsSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
+    if (!existing) return;
+    if (req.actor.type !== "board") throw forbidden("Only board users can set agent grants");
+    const userId = req.actor.userId ?? null;
+    const privileged = req.actor.source === "local_implicit" || req.actor.isInstanceAdmin === true;
+    if (!privileged && !(userId && await access.canUser(existing.companyId, userId, "users:manage_permissions"))) {
+      throw forbidden("Missing permission: users:manage_permissions", { code: "agent_grants_permission_required" });
+    }
+    const body = setAgentGrantsSchema.parse(req.body);
+    const managedElsewhere = body.grants.map((g) => g.permissionKey).filter((key) => AGENT_GRANT_ROUTE_PRESERVED_KEYS.has(key));
+    if (managedElsewhere.length) {
+      throw unprocessable("tasks:assign is managed by PATCH /agents/:id/permissions (canAssignTasks)", {
+        code: "agent_grant_managed_elsewhere",
+        keys: [...new Set(managedElsewhere)],
+      });
+    }
+    const refused = body.grants.map((g) => g.permissionKey).filter((key) => AGENT_GRANT_REFUSED_KEYS.has(key));
+    if (refused.length) {
+      throw unprocessable(`These permissions cannot be granted to an agent: ${[...new Set(refused)].join(", ")}`, {
+        code: "agent_grant_refused",
+        refused: [...new Set(refused)],
+      });
+    }
+    const before = await access.listPrincipalGrants(existing.companyId, "agent", existing.id);
+    const next = new Map<string, { permissionKey: PermissionKey; scope: Record<string, unknown> | null }>();
+    // Keys managed elsewhere survive a replace untouched.
+    for (const grant of before) {
+      if (body.replace && !AGENT_GRANT_ROUTE_PRESERVED_KEYS.has(grant.permissionKey)) continue;
+      next.set(grant.permissionKey, { permissionKey: grant.permissionKey as PermissionKey, scope: (grant.scope as Record<string, unknown> | null) ?? null });
+    }
+    for (const grant of body.grants) next.set(grant.permissionKey, { permissionKey: grant.permissionKey, scope: grant.scope ?? null });
+    await access.ensureMembership(existing.companyId, "agent", existing.id, "member", "active");
+    await access.setPrincipalGrants(existing.companyId, "agent", existing.id, [...next.values()], userId);
+    const after = await access.listPrincipalGrants(existing.companyId, "agent", existing.id);
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: existing.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "agent.grants_updated",
+      entityType: "agent",
+      entityId: existing.id,
+      details: {
+        replace: body.replace,
+        before: before.map((g) => g.permissionKey).sort(),
+        after: after.map((g) => g.permissionKey).sort(),
+      },
+    });
+    res.json({ agentId: existing.id, grants: after.map((g) => ({ permissionKey: g.permissionKey, scope: g.scope ?? null })) });
   });
 
   router.patch("/agents/:id/instructions-path", validate(updateAgentInstructionsPathSchema), async (req, res) => {
