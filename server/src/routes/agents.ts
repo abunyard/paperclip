@@ -3326,7 +3326,8 @@ export function agentRoutes(
             : [];
           endpoint = endpointFromConnectionConfig(connection?.config);
         }
-        await validateAiApiKey(binding.provider, key, fetch, endpoint);
+        if (endpoint) await validateAiApiKey(binding.provider, key, fetch, endpoint);
+        else await validateAiApiKey(binding.provider, key);
         result.checks.push({ code: "ai_connection_api_key_reverified", level: "info", message: "The provider verified this API key for adoption." });
       } catch (error) {
         result.status = "fail";
