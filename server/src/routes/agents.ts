@@ -1,9 +1,10 @@
 import { listOpenRouterModels } from "../services/openrouter-models.js";
 import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings } from "../services/ai-connection-runtime.js";
-import { ADAPTER_AUTH_MISSING_CHECK_CODE, AI_CONNECTION_CAPABILITIES, PERMISSION_KEYS, aiConnectionBindingSchema, type AiConnectionBinding, type PermissionKey } from "@paperclipai/shared";
+import { ADAPTER_AUTH_MISSING_CHECK_CODE, AI_CONNECTION_CAPABILITIES, PERMISSION_KEYS, aiConnectionBindingSchema, changedLocalConfinementKeys, droppedLocalConfinementKeys, pickLocalConfinement, type AiConnectionBinding, type PermissionKey } from "@paperclipai/shared";
 import { z } from "zod";
 import { endpointFromConnectionConfig } from "../services/anthropic-compatible-endpoint.js";
 import { toolConnections } from "@paperclipai/db";
+import { resolveLocalConfinementPolicy } from "../services/local-confinement-policy.js";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { defaultAiConnectionForHire } from "../services/agent-ai-connection-default.js";
 import { assertAiConnectionCreateAccess, canInstallSharedAiConnectionForNewAgent, responsibleUserForAiRequest, validateAiApiKey } from "./ai-connections.js";
@@ -759,6 +760,7 @@ export function agentRoutes(
   const companySkills = companySkillService(db);
   const workspaceOperations = workspaceOperationService(db);
   const instanceSettings = instanceSettingsService(db);
+  const localConfinementRequired = async () => (await resolveLocalConfinementPolicy(db)).required;
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
 
   // The company-scoped adapter login-session service. It runs the device-login
@@ -2902,6 +2904,52 @@ export function agentRoutes(
     );
   }
 
+  // wabnet L0009: local bwrap confinement is board-controlled.
+  // Agents may not add, change or remove any confinement key on any agent (self or peer);
+  // a board change that DROPS a key must be explicit (covers upstream #11079).
+  function assertConfinementTransition(
+    req: Request,
+    before: unknown,
+    after: unknown,
+    options: { allowConfinementChange?: boolean } = {},
+  ) {
+    if (req.actor.type === "agent") {
+      const changed = changedLocalConfinementKeys(before, after);
+      if (changed.length) {
+        throw forbidden(`Agents cannot change local confinement settings: ${changed.join(", ")}`, {
+          code: "agent_confinement_locked",
+          keys: changed,
+        });
+      }
+      return;
+    }
+    const dropped = droppedLocalConfinementKeys(before, after);
+    if (dropped.length && options.allowConfinementChange !== true) {
+      throw unprocessable(
+        `This change removes local confinement settings (${dropped.join(", ")}). Resend with allowConfinementChange: true to confirm.`,
+        { code: "confinement_change_requires_flag", keys: dropped },
+      );
+    }
+  }
+
+  // wabnet L0009: an agent-created agent inherits its creator's confinement; the request may
+  // not supply different confinement values. Mutates `rawAdapterConfig` in place.
+  async function applyAgentCreatorConfinement(req: Request, rawAdapterConfig: Record<string, unknown>) {
+    if (req.actor.type !== "agent" || !req.actor.agentId) return;
+    const creator = await svc.getById(req.actor.agentId);
+    const inherited = pickLocalConfinement(creator?.adapterConfig);
+    const requested = pickLocalConfinement(rawAdapterConfig);
+    const conflicting = Object.keys(requested).filter((key) =>
+      JSON.stringify(requested[key as keyof typeof requested]) !== JSON.stringify(inherited[key as keyof typeof inherited]));
+    if (conflicting.length) {
+      throw forbidden(`Agents cannot set local confinement on agents they create: ${conflicting.join(", ")}`, {
+        code: "agent_confinement_locked",
+        keys: conflicting,
+      });
+    }
+    Object.assign(rawAdapterConfig, inherited);
+  }
+
   function summarizeAgentUpdateDetails(patch: Record<string, unknown>) {
     const changedTopLevelKeys = Object.keys(patch).sort();
     const details: Record<string, unknown> = { changedTopLevelKeys };
@@ -4332,6 +4380,9 @@ export function agentRoutes(
       await assertSelectableAdapterType(rollbackAdapterType);
     }
     const rollbackAdapterConfig = asRecord(rollbackConfig.adapterConfig) ?? {};
+    assertConfinementTransition(req, existing.adapterConfig, rollbackAdapterConfig, {
+      allowConfinementChange: (req.body as { allowConfinementChange?: unknown } | undefined)?.allowConfinementChange === true,
+    });
     assertExternalInstructionsAdmin(req, existing);
     assertExternalInstructionsAdmin(req, {
       ...existing,
@@ -4469,6 +4520,7 @@ export function agentRoutes(
       rawHireAdapterConfig,
     );
     assertNoAgentAdapterConfigMutation(req, rawHireAdapterConfig);
+    await applyAgentCreatorConfinement(req, rawHireAdapterConfig);
     const hiredAgentId = randomUUID();
     const authInheritance = await applyHiringAgentAuthInheritance(
       req,
@@ -4771,6 +4823,7 @@ export function agentRoutes(
       rawCreateAdapterConfig,
     );
     assertNoAgentAdapterConfigMutation(req, rawCreateAdapterConfig);
+    await applyAgentCreatorConfinement(req, rawCreateAdapterConfig);
     const agentId = randomUUID();
     const requestedAdapterConfig = applyCodexLocalKeyIsolation(
       companyId,
@@ -5270,6 +5323,8 @@ export function agentRoutes(
     const patchData = { ...(req.body as Record<string, unknown>) };
     const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
     delete patchData.replaceAdapterConfig;
+    const allowConfinementChange = patchData.allowConfinementChange === true;
+    delete patchData.allowConfinementChange;
     // The apply-existing flag is not an agent column. The server binds the fixed
     // reference to the owner stored value with no login round trip. Remove it
     // from the patch so it never reaches the update values.
@@ -5421,6 +5476,14 @@ export function agentRoutes(
           allowedSandboxProviders: allowedSandboxProvidersForAgent(requestedAdapterType),
         },
       );
+    }
+    // wabnet L0009: compare the effective adapterConfig (after merge / replace / adapter-type change).
+    assertConfinementTransition(req, existing.adapterConfig, patchData.adapterConfig ?? existing.adapterConfig, { allowConfinementChange });
+    if (req.actor.type === "agent" && requestedAdapterType !== existing.adapterType && (await localConfinementRequired())) {
+      throw forbidden("Agents cannot change an agent's adapter type while local confinement is required", {
+        code: "agent_confinement_locked",
+        keys: ["adapterType"],
+      });
     }
     const touchesProfileFields = touchesAgentProfileChangeConsentFields(patchData);
     const profileOnlyChange = touchesProfileFields && Object.keys(patchData).every((key) =>

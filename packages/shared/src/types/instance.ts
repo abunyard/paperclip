@@ -38,6 +38,10 @@ export interface InstanceGeneralSettings {
    * Kubernetes sandbox provider and denies local/ssh execution.
    */
   executionMode?: InstanceExecutionMode;
+  /** wabnet L0009: fail local agent runs closed when bwrap confinement is missing. */
+  requireLocalConfinement?: boolean;
+  /** wabnet L0009: agents allowed to run unconfined while requireLocalConfinement is on. */
+  localConfinementExemptAgentIds?: string[];
 }
 
 export interface InstanceExperimentalSettings {

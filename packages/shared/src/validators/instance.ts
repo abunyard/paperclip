@@ -32,6 +32,10 @@ export const instanceGeneralSettingsSchema = z.object({
   // Execution policy. Absent/"any" = unrestricted; "kubernetes" forces the
   // Kubernetes sandbox provider and denies local/ssh execution (cloud_tenant).
   executionMode: z.enum(["kubernetes", "any"]).optional(),
+  // wabnet L0009: fail claude_local/codex_local runs closed when local confinement
+  // (filesystemScope "workspace" + a networkScope) is missing. Board (instance admin) only.
+  requireLocalConfinement: z.boolean().optional(),
+  localConfinementExemptAgentIds: z.array(z.string().uuid()).max(500).optional(),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = z

@@ -9,6 +9,7 @@ import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAs
 import { admitExplicitNativeContinuation, undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
 import { connectionIntentService } from "./connection-intents.js";
 import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
+import { localConfinementViolation, resolveLocalConfinementPolicy } from "./local-confinement-policy.js";
 import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
@@ -20896,6 +20897,23 @@ export function heartbeatService(
           secretsSvc,
           trustPreset,
         });
+      // wabnet L0009: fail closed before any adapter/runtime preparation when confinement is required.
+      const confinementViolation = localConfinementViolation(
+        await resolveLocalConfinementPolicy(db),
+        { id: agent.id, adapterType: agent.adapterType },
+        resolvedConfig,
+      );
+      if (confinementViolation) {
+        throw new ConfigurationIncompleteFailure(confinementViolation, {
+          configurationIncomplete: {
+            reason: "local_confinement_required",
+            companyId: agent.companyId,
+            agentId: agent.id,
+            actionUrl: `/agents/${agent.id}/runtime`,
+            fingerprint: `local-confinement:${agent.id}`,
+          },
+        });
+      }
       if (aiBinding) {
         try {
           managedAiRuntime = await prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig });
