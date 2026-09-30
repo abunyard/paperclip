@@ -60,6 +60,7 @@ import {
   parseLocalProcessNetworkScope,
   type LocalProcessSandboxOptions,
 } from "@paperclipai/adapter-utils/local-process-sandbox";
+import { resolveGitSandboxMounts } from "@paperclipai/adapter-utils/local-process-sandbox-git";
 import {
   claudeModelUsageTotals,
   parseClaudeStreamJson,
@@ -568,6 +569,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const sharedClaudeConfigDir = config.managedAiConnection ? asString(configEnv.CLAUDE_CONFIG_DIR, "") : resolveSharedClaudeConfigDir(process.env);
   const networkScope = parseLocalProcessNetworkScope(config.networkScope);
   const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
+  // wabnet L0008: give a workspace-scoped sandbox the git metadata it needs, with hooks,
+  // config and pointer files read-only (see local-process-sandbox-git.ts).
+  const gitSandboxPlan = filesystemScope === "workspace" && !executionTargetIsRemote
+    ? await resolveGitSandboxMounts(effectiveExecutionCwd)
+    : null;
   const localProcessSandbox: LocalProcessSandboxOptions | null =
     (filesystemScope || networkScope) && !executionTargetIsRemote
       ? {
@@ -580,6 +586,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             { path: localMcpConfigDir, access: "ro" },
           ],
           extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
+          postWorkspacePaths: gitSandboxPlan?.paths ?? [],
+          bindSyslog: config.filesystemBindSyslog === true,
           homeDir: filesystemScope ? path.dirname(sharedClaudeConfigDir) : null,
           networkScope,
           networkAllowlist: parseLocalProcessNetworkAllowlist(config.networkAllowlist),
@@ -599,6 +607,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       "stdout",
       `[paperclip] Confining Claude with ${scopes} scope.\n`,
     );
+    if (gitSandboxPlan)
+      await onLog(
+        "stdout",
+        `[paperclip] Sandbox git: ${gitSandboxPlan.worktree ? "worktree" : "repository"} metadata mounted (hooks, config and pointer files read-only).\n`,
+      );
   }
   const useManagedRemoteClaudeConfig =
     executionTargetIsRemote &&

@@ -29,6 +29,17 @@ export interface LocalProcessSandboxOptions {
   networkAllowlist?: string[];
   networkTrustedUrls?: string[];
   command?: string;
+  /**
+   * Mounted in order AFTER the workspace, so they can overlay it (wabnet L0008: git
+   * metadata, read-write where git writes, read-only hooks/config/pointer files on top).
+   */
+  postWorkspacePaths?: LocalProcessSandboxPath[];
+  /**
+   * Bind the host syslog socket (realpath of /dev/log) at /dev/log, read-write, so tools
+   * inside the sandbox (e.g. a Claude Code guard hook calling logger/syslog) can log.
+   * Opt-in: it lets the sandboxed process write arbitrary syslog lines.
+   */
+  bindSyslog?: boolean;
   /** Test seam for the /bin, /sbin, /lib, /lib64 layout probe (wabnet L0010). */
   rootSystemPathProbe?: (candidate: string) => Promise<RootSystemPathKind>;
 }
@@ -445,6 +456,11 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
     for (const managedPath of input.options.managedPaths ?? []) await mount(managedPath.path, managedPath.access);
     for (const extraPath of input.options.extraPaths ?? []) await mount(extraPath.path, extraPath.access);
     await mount(workspaceDir, "rw");
+    for (const overlay of input.options.postWorkspacePaths ?? []) await mount(overlay.path, overlay.access);
+    if (input.options.bindSyslog) {
+      const socket = await fs.realpath("/dev/log").catch(() => null);
+      if (socket) args.push("--bind", socket, "/dev/log");
+    }
     for (const [index, alias] of (input.options.pathAliases ?? []).entries()) {
       const aliasPath = normalizeAbsolutePath(alias.path, `Sandbox pathAliases[${index}].path`);
       const aliasTarget = normalizeAbsolutePath(alias.target, `Sandbox pathAliases[${index}].target`);
