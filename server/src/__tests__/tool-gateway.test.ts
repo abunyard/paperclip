@@ -1,5 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage } from "node:http";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import express from "express";
 import { and, eq } from "drizzle-orm";
 import request from "supertest";
@@ -312,6 +315,7 @@ async function createLocalStdioMcpTool(
     stdioScript?: string;
     envKeys?: string[];
     connectionConfig?: Record<string, unknown>;
+    templateToolExtras?: Record<string, unknown>;
   } = {},
 ) {
   const applicationKey = input.applicationKey ?? `local-app-${randomUUID().slice(0, 8)}`;
@@ -357,6 +361,7 @@ rl.on("line", (line) => {
           additionalProperties: false,
         },
         annotations: { readOnlyHint: true },
+        ...(input.templateToolExtras ?? {}),
       },
     ],
   });
@@ -1842,6 +1847,119 @@ rl.on("line", (line) => {
       if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL;
       else process.env.DATABASE_URL = previousDatabaseUrl;
     }
+  });
+
+  describe("run-workspace output argument (wabnet L0014)", () => {
+    const argsEchoScript = `
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "args-stdio", version: "0.0.0" } } }) + "\\n");
+    return;
+  }
+  if (message.method === "tools/call") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: "args" }], structuredContent: { outputDirectory: message.params?.arguments?.output_directory ?? null, message: message.params?.arguments?.message ?? null } } }) + "\\n");
+  }
+});
+`;
+
+    async function setup(
+      workspaceCwd: string | null,
+      extras: Record<string, unknown> | undefined,
+      connectionConfig?: Record<string, unknown>,
+    ) {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run, project } = await createIssueAndRun(db, company.id, agent.id);
+      if (workspaceCwd) {
+        await db.update(heartbeatRuns).set({
+          contextSnapshot: { projectId: project.id, paperclipWorkspace: { cwd: workspaceCwd } },
+        }).where(eq(heartbeatRuns.id, run.id));
+      }
+      const applicationKey = `local-out-${randomUUID().slice(0, 8)}`;
+      const localTool = await createLocalStdioMcpTool(db, company.id, {
+        applicationKey,
+        toolName: "text_to_image",
+        stdioScript: argsEchoScript,
+        templateToolExtras: extras,
+        connectionConfig,
+      });
+      const profile = await allowToolsForAgent(db, company.id, agent.id, []);
+      await db.insert(toolProfileEntries).values({
+        companyId: company.id,
+        profileId: profile.id,
+        selectorType: "catalog_entry",
+        effect: "include",
+        catalogEntryId: localTool.catalogEntry.id,
+      });
+      const gateway = createTestToolGatewayService(db, { runtimeSupervisor: { idleTtlMs: 10_000 } });
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const tool = expectedConnectedToolName({ applicationKey, connectionId: localTool.connection.id, toolName: "text_to_image" });
+      return { gateway, session, tool };
+    }
+
+    const declared = { paperclipRunWorkspaceArgument: { name: "output_directory", subpath: "assets/generated" } };
+
+    it("points the declared argument at the calling run's workspace and creates the directory", async () => {
+      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "pc-l0014-"));
+      try {
+        const { gateway, session, tool } = await setup(cwd, declared);
+        const result = await gateway.executeTool({ sessionToken: session.token, tool, parameters: { message: "cat" } });
+        const expected = path.join(await fs.realpath(cwd), "assets", "generated");
+        expect(result).toMatchObject({
+          status: "completed",
+          result: { data: { structuredContent: { outputDirectory: expected, message: "cat" } } },
+        });
+        await expect(fs.stat(expected)).resolves.toMatchObject({});
+      } finally {
+        await fs.rm(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it("accepts the declaration from the board-editable connection config", async () => {
+      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "pc-l0014-"));
+      try {
+        const { gateway, session, tool } = await setup(cwd, undefined, {
+          runWorkspaceArguments: { text_to_image: { name: "output_directory", subpath: "assets/generated" } },
+        });
+        await expect(gateway.executeTool({ sessionToken: session.token, tool, parameters: { message: "c" } }))
+          .resolves.toMatchObject({
+            result: { data: { structuredContent: { outputDirectory: path.join(await fs.realpath(cwd), "assets", "generated") } } },
+          });
+      } finally {
+        await fs.rm(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it("leaves the arguments alone without the template declaration or a run workspace", async () => {
+      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "pc-l0014-"));
+      try {
+        const undeclared = await setup(cwd, undefined);
+        await expect(undeclared.gateway.executeTool({ sessionToken: undeclared.session.token, tool: undeclared.tool, parameters: { message: "a" } }))
+          .resolves.toMatchObject({ result: { data: { structuredContent: { outputDirectory: null } } } });
+        const noWorkspace = await setup(null, declared);
+        await expect(noWorkspace.gateway.executeTool({ sessionToken: noWorkspace.session.token, tool: noWorkspace.tool, parameters: { message: "b" } }))
+          .resolves.toMatchObject({ result: { data: { structuredContent: { outputDirectory: null } } } });
+      } finally {
+        await fs.rm(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it("refuses an output path that a symlink resolves outside the run workspace", async () => {
+      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "pc-l0014-"));
+      const outside = await fs.mkdtemp(path.join(os.tmpdir(), "pc-l0014-outside-"));
+      try {
+        await fs.symlink(outside, path.join(cwd, "assets"));
+        const { gateway, session, tool } = await setup(cwd, declared);
+        const result = await gateway.executeTool({ sessionToken: session.token, tool, parameters: { message: "x" } }).catch((error) => error);
+        expect(JSON.stringify(result)).toContain("tool_output_path_outside_workspace");
+      } finally {
+        await fs.rm(cwd, { recursive: true, force: true });
+        await fs.rm(outside, { recursive: true, force: true });
+      }
+    });
   });
 
   it("passes only the selected grant identity to local stdio MCP processes", async () => {

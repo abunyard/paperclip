@@ -3,6 +3,8 @@ import { captureRunIdentity } from "./run-identity.js";
 import { resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
 import { logger } from "../middleware/logger.js";
 import { spawn } from "node:child_process";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   and,
@@ -401,6 +403,8 @@ type LocalStdioRuntimeTemplate = {
   command: string | null;
   args: string[];
   envKeys: string[];
+  /** Template tool definitions (custom templates only); read for wabnet L0014 metadata. */
+  tools?: Array<Record<string, unknown>>;
 };
 
 const BUILTIN_LOCAL_STDIO_RUNTIME_TEMPLATES: Record<
@@ -4814,7 +4818,57 @@ export function createToolGatewayService(
       command: template.command,
       args: template.args ?? [],
       envKeys: template.envKeys ?? [],
+      tools: template.tools ?? [],
     };
+  }
+
+  // wabnet L0014: a template tool may declare `paperclipRunWorkspaceArgument: { name, subpath }`,
+  // or (because templates are immutable once created) the connection config may carry
+  // `runWorkspaceArguments: { "<toolName>": { name, subpath } }` (board-editable via PATCH).
+  // The gateway then sets that argument to the CALLING run's workspace (e.g. its git worktree),
+  // so a server-side stdio tool that writes files (MiniMax text_to_image's output_directory)
+  // saves where a sandboxed agent can read them. The server owns the value: an agent cannot
+  // redirect it, and a resolved path outside the run workspace (e.g. through a symlink) is refused.
+  async function injectRunWorkspaceArgument(
+    session: ToolGatewaySession,
+    connection: typeof toolConnections.$inferSelect,
+    template: LocalStdioRuntimeTemplate,
+    toolName: string,
+    parameters: unknown,
+  ): Promise<unknown> {
+    const def = (template.tools ?? []).find((candidate) => candidate.name === toolName);
+    const fromConnection = (config: unknown) =>
+      asRecord(asRecord(asRecord(config)?.runWorkspaceArguments)?.[toolName]);
+    const spec =
+      asRecord(def?.paperclipRunWorkspaceArgument) ??
+      fromConnection(connection.config) ??
+      fromConnection(connection.transportConfig);
+    const argumentName = typeof spec?.name === "string" ? spec.name.trim() : "";
+    if (!argumentName || !session.runId) return parameters;
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(argumentName)) {
+      throw new ToolGatewayHttpError(422, "Invalid run workspace argument name", "local_stdio_template_invalid");
+    }
+    const [run] = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, session.runId), eq(heartbeatRuns.companyId, session.companyId)))
+      .limit(1);
+    const workspace = asRecord(asRecord(run?.contextSnapshot)?.paperclipWorkspace);
+    const cwd = typeof workspace?.cwd === "string" && path.isAbsolute(workspace.cwd) ? workspace.cwd : null;
+    if (!cwd) return parameters;
+    const subpath = typeof spec?.subpath === "string" ? spec.subpath.trim() : "";
+    if (path.isAbsolute(subpath) || subpath.split(/[\\/]+/).includes("..")) {
+      throw new ToolGatewayHttpError(422, "Invalid run workspace subpath on the tool template", "local_stdio_template_invalid");
+    }
+    const root = await fs.realpath(cwd);
+    const target = path.join(root, subpath);
+    await fs.mkdir(target, { recursive: true });
+    const resolved = await fs.realpath(target);
+    const relative = path.relative(root, resolved);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      throw new ToolGatewayHttpError(422, "The run workspace output path resolves outside the workspace", "tool_output_path_outside_workspace");
+    }
+    return { ...(asRecord(parameters) ?? {}), [argumentName]: resolved };
   }
 
   async function localStdioEnvironment(
@@ -6146,6 +6200,7 @@ export function createToolGatewayService(
       template,
       grant,
     );
+    parameters = await injectRunWorkspaceArgument(session, connection, template, entry.toolName, parameters);
     const result = await runtimeSupervisor.useConnectionSlot(
       {
         companyId: session.companyId,
