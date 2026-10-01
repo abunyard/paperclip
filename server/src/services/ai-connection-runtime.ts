@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { HttpError, unprocessable } from "../errors.js";
-import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
+import { cp, lstat, mkdtemp, mkdir, readdir, writeFile, readFile, rm } from "node:fs/promises";
+import { resolvePaperclipInstanceRoot } from "../home-paths.js";
+import { logger } from "../middleware/logger.js";
 import os from "node:os";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
@@ -235,6 +237,56 @@ export function decideClaudeAuthMerge(refreshed: string, current: string): numbe
 }
 
 // Port of upstream 2a99de80e (#13699), session-fingerprint part only (wabnet L0013).
+// wabnet L0013c: Claude Code keeps session transcripts in $CLAUDE_CONFIG_DIR/projects, which for a
+// managed run is inside the per-run temporary home that is deleted after the run. Without
+// persisting them, `--resume <id>` on the next run always fails with "No conversation found" and
+// the adapter silently starts fresh. The transcripts (not credentials, not Claude's auto-memory)
+// are copied out to a per-agent store after the run and copied into the next run's home.
+const MANAGED_TRANSCRIPT_MAX_FILE_BYTES = 64 * 1024 * 1024;
+const MANAGED_TRANSCRIPT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const SAFE_SEGMENT = /^[a-zA-Z0-9_-]+$/;
+
+export function managedAiTranscriptStoreDir(companyId: string, agentId: string): string | null {
+  if (!SAFE_SEGMENT.test(companyId) || !SAFE_SEGMENT.test(agentId)) return null;
+  return path.join(resolvePaperclipInstanceRoot(), "data", "managed-ai-transcripts", companyId, agentId, "projects");
+}
+
+/** Copy only real directories and size-capped regular files; skip symlinks and Claude's `memory` dirs. */
+async function copyTranscripts(from: string, to: string, pruneOlderThanMs?: number): Promise<void> {
+  try {
+    await lstat(from);
+  } catch {
+    return;
+  }
+  if (pruneOlderThanMs !== undefined) {
+    const cutoff = Date.now() - pruneOlderThanMs;
+    const walk = async (dir: string): Promise<void> => {
+      for (const entry of await readdir(dir, { withFileTypes: true }).catch(() => [])) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) await walk(full);
+        else {
+          const info = await lstat(full).catch(() => null);
+          if (info && info.mtimeMs < cutoff) await rm(full, { force: true });
+        }
+      }
+    };
+    await walk(from);
+  }
+  await mkdir(to, { recursive: true, mode: 0o700 });
+  await cp(from, to, {
+    recursive: true,
+    force: true,
+    preserveTimestamps: true,
+    filter: async (source) => {
+      if (path.relative(from, source).split(path.sep).includes("memory")) return false;
+      const info = await lstat(source).catch(() => null);
+      if (!info) return false;
+      if (info.isDirectory()) return true;
+      return info.isFile() && info.size <= MANAGED_TRANSCRIPT_MAX_FILE_BYTES;
+    },
+  });
+}
+
 function managedAiHomeEnvironment(home: string): Record<string, string> {
   const providerHome = path.join(home, "provider");
   return {
@@ -341,6 +393,12 @@ export async function prepareManagedAiRuntime(
     );
     const providerHome = path.join(home, "provider");
     await mkdir(providerHome, { mode: 0o700 });
+    const transcriptStore = managedAiTranscriptStoreDir(input.companyId, input.agentId);
+    if (transcriptStore) {
+      await copyTranscripts(transcriptStore, path.join(providerHome, "projects"), MANAGED_TRANSCRIPT_RETENTION_MS).catch((error) =>
+        logger.warn({ err: error, agentId: input.agentId }, "managed AI transcript restore failed; the run starts without saved transcripts"),
+      );
+    }
     const env: Record<string, unknown> = {
       ...stripAiAuthBindings(input.config.env),
       ...Object.fromEntries(AI_AUTH_ENV_KEYS.map((key) => [key, ""])),
@@ -483,6 +541,11 @@ export async function prepareManagedAiRuntime(
               });
           }
         } finally {
+          if (home && transcriptStore) {
+            await copyTranscripts(path.join(providerHome, "projects"), transcriptStore).catch((error) =>
+              logger.warn({ err: error, agentId: input.agentId }, "managed AI transcript save failed; the next run cannot resume this session"),
+            );
+          }
           if (home) await rm(home, { recursive: true, force: true });
         }
       },

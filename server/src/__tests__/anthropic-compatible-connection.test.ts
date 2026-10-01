@@ -2,7 +2,7 @@
 // probes) and the env-agent migration. Credentials are fixtures and must never appear in output.
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { eq } from "drizzle-orm";
@@ -18,7 +18,7 @@ import {
   isAllowedAnthropicCompatibleBaseUrl,
 } from "@paperclipai/shared";
 import { aiConnectionService } from "../services/ai-connections.js";
-import { prepareManagedAiRuntime } from "../services/ai-connection-runtime.js";
+import { managedAiTranscriptStoreDir, prepareManagedAiRuntime } from "../services/ai-connection-runtime.js";
 import {
   buildEffectiveRunSessionConfigMetadata,
   describeTaskSessionCredentialMismatch,
@@ -191,6 +191,34 @@ describe("session resume across managed runs (L0013, upstream #13699)", () => {
       expect(isTaskSessionCredentialCompatible(stored, b.identity)).toBe(true);
       expect(describeTaskSessionCredentialMismatch(stored, b.identity)).toBeNull();
     } finally { await a.cleanup(); await b.cleanup(); }
+  });
+});
+
+describe("managed transcripts survive the per-run home (L0013c)", () => {
+  it("carries Claude session transcripts to the next run, but not memory, symlinks, or credentials", async () => {
+    const service = aiConnectionService(db);
+    const saved = await service.save(companyId, owner, { provider: "anthropic_compatible", method: "api_key", name: "Transcript check", ownership: "shared", apiKey: KEY, agentIds: [agentId], allAgents: false, endpoint }, KEY);
+    const binding = { provider: "anthropic_compatible", method: "api_key", mode: "shared", connectionId: saved.connectionId, grantId: saved.grantId } as const;
+    const input = { companyId, agentId, responsibleUserId: owner, adapterType: "claude_local", binding, config: { model: "MiniMax-M3", env: {} } };
+    const sid = randomUUID();
+    const a = await prepareManagedAiRuntime(db, input);
+    const project = path.join(a.home!, "provider", "projects", "-work-tree");
+    await mkdir(path.join(project, "memory"), { recursive: true });
+    await writeFile(path.join(project, `${sid}.jsonl`), '{"type":"user","message":"remember: aubergine"}\n');
+    await writeFile(path.join(project, "memory", "MEMORY.md"), "not carried");
+    await symlink("/etc/passwd", path.join(project, "escape.jsonl"));
+    await writeFile(path.join(a.home!, "provider", ".credentials.json"), "secret");
+    await a.cleanup();
+    const b = await prepareManagedAiRuntime(db, input);
+    try {
+      const carried = path.join(b.home!, "provider", "projects", "-work-tree");
+      expect(await readFile(path.join(carried, `${sid}.jsonl`), "utf8")).toContain("aubergine");
+      await expect(lstat(path.join(carried, "memory"))).rejects.toThrow();
+      await expect(lstat(path.join(carried, "escape.jsonl"))).rejects.toThrow();
+      const store = managedAiTranscriptStoreDir(companyId, agentId)!;
+      await expect(lstat(path.join(path.dirname(store), ".credentials.json"))).rejects.toThrow();
+      await expect(lstat(path.join(store, ".credentials.json"))).rejects.toThrow();
+    } finally { await b.cleanup(); }
   });
 });
 
