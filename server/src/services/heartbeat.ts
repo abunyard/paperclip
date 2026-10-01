@@ -5730,7 +5730,11 @@ const SESSION_CONFIG_FINGERPRINT_VERSION_KEY =
 const SESSION_CONFIG_CATEGORIES_KEY = "__paperclipConfigCategories";
 const SESSION_CONFIG_CATEGORY_FINGERPRINTS_KEY =
   "__paperclipConfigCategoryFingerprints";
+// wabnet L0013b (port of upstream #13710 part): server-owned, read from the RAW stored
+// params because adapter session codecs drop unknown keys on deserialize.
+const SESSION_AI_CREDENTIAL_IDENTITY_KEY = "paperclipAiCredentialIdentity";
 const PAPERCLIP_SESSION_METADATA_KEYS = new Set([
+  SESSION_AI_CREDENTIAL_IDENTITY_KEY,
   SESSION_CONFIGURED_MODEL_KEY,
   SESSION_CONFIG_FINGERPRINT_KEY,
   SESSION_CONFIG_FINGERPRINT_VERSION_KEY,
@@ -6724,6 +6728,38 @@ export function resolveExecutionWorkspaceConfigFreshness(input: {
   };
 }
 
+/** Read server-owned identity before adapter codecs discard unknown metadata. */
+export function isTaskSessionCredentialCompatible(
+  storedSessionParams: Record<string, unknown> | null | undefined,
+  managedAiCredentialIdentity: string | undefined,
+): boolean {
+  if (!managedAiCredentialIdentity) return true;
+  return storedSessionParams?.[SESSION_AI_CREDENTIAL_IDENTITY_KEY] === managedAiCredentialIdentity;
+}
+
+/**
+ * wabnet L0013b: a human-readable reason a saved session is not resumed because of the
+ * managed credential identity (`<grantId>:<responsibleUser|shared>:<credentialGeneration>`).
+ * Names only the part that changed; never prints identity values.
+ */
+export function describeTaskSessionCredentialMismatch(
+  storedSessionParams: Record<string, unknown> | null | undefined,
+  managedAiCredentialIdentity: string | undefined,
+): string | null {
+  if (isTaskSessionCredentialCompatible(storedSessionParams, managedAiCredentialIdentity)) return null;
+  const stored = storedSessionParams?.[SESSION_AI_CREDENTIAL_IDENTITY_KEY];
+  if (typeof stored !== "string" || !stored) {
+    return "the saved session has no managed AI credential identity (it was saved by an unmanaged run or an older build)";
+  }
+  const [storedGrant, storedUser, storedGeneration] = stored.split(":");
+  const [grant, user, generation] = String(managedAiCredentialIdentity).split(":");
+  const changed: string[] = [];
+  if (storedGrant !== grant) changed.push("AI connection grant");
+  if (storedUser !== user) changed.push("responsible user");
+  if (storedGeneration !== generation) changed.push("credential generation (the stored secret changed)");
+  return `the managed AI credential changed: ${changed.length > 0 ? changed.join(", ") : "identity"}`;
+}
+
 function readConfiguredModelFromAdapterConfig(
   adapterConfig: Record<string, unknown> | null | undefined,
 ) {
@@ -6739,7 +6775,7 @@ function attachPaperclipSessionMetadataToSessionParams(
   const next = { ...(sessionParams ?? {}) };
   if (configuredModel) next[SESSION_CONFIGURED_MODEL_KEY] = configuredModel;
   if (configMetadata) {
-    if (configMetadata.aiCredentialIdentity) next.paperclipAiCredentialIdentity = configMetadata.aiCredentialIdentity;
+    if (configMetadata.aiCredentialIdentity) next[SESSION_AI_CREDENTIAL_IDENTITY_KEY] = configMetadata.aiCredentialIdentity;
     next[SESSION_CONFIG_FINGERPRINT_KEY] = configMetadata.fingerprint;
     next[SESSION_CONFIG_FINGERPRINT_VERSION_KEY] = configMetadata.version;
     next[SESSION_CONFIG_CATEGORIES_KEY] = configMetadata.categories;
@@ -22097,11 +22133,12 @@ export function heartbeatService(
               `Execution workspace reuse freshness action "${workspaceConfigFreshness.action}" because ${workspaceConfigFreshness.reasons.join("; ")}.`,
             ]
           : []),
-        ...(resetTaskSession && sessionResetReason
+        ...(resetTaskSession && (sessionResetReason || taskSession)
           ? [
+              // wabnet L0013b: never drop a saved session silently.
               taskKey
-                ? `Skipping saved session resume for task "${taskKey}" because ${sessionResetReason}.`
-                : `Skipping saved session resume because ${sessionResetReason}.`,
+                ? `Skipping saved session resume for task "${taskKey}" because ${sessionResetReason ?? "a session reset was requested (no reason recorded)"}.`
+                : `Skipping saved session resume because ${sessionResetReason ?? "a session reset was requested (no reason recorded)"}.`,
             ]
           : []),
       ];
@@ -22246,9 +22283,23 @@ export function heartbeatService(
         delete context.paperclipPreviousSessionId;
       }
 
+      // wabnet L0013b: compare against the RAW stored params. The adapter codecs (claude_local,
+      // acpx, codex) drop this key on deserialize, so the old check against the decoded params
+      // was always unequal and silently discarded every managed session (upstream #13710).
+      const taskSessionCredentialCompatible = isTaskSessionCredentialCompatible(
+        taskSession?.sessionParamsJson,
+        managedAiRuntime?.identity,
+      );
       if (managedAiRuntime) {
         sessionConfigMetadata.aiCredentialIdentity = managedAiRuntime.identity;
-        if (taskSessionDecodedParams?.paperclipAiCredentialIdentity !== managedAiRuntime.identity) {
+        if (!taskSessionCredentialCompatible) {
+          const hadSessionToResume = Boolean(runtimeSessionIdForAdapter || runtimeSessionParamsForAdapter || previousSessionDisplayId);
+          if (hadSessionToResume) {
+            const reason = describeTaskSessionCredentialMismatch(taskSession?.sessionParamsJson, managedAiRuntime.identity);
+            runtimeWorkspaceWarnings.push(
+              `Skipping saved session resume${taskKey ? ` for task "${taskKey}"` : ""} because ${reason}.`,
+            );
+          }
           runtimeSessionIdForAdapter = null;
           runtimeSessionParamsForAdapter = null;
           previousSessionDisplayId = null;
@@ -22758,7 +22809,7 @@ export function heartbeatService(
                     return requests.length > 0 ? requests : undefined;
                   })(),
                 });
-          const taskNativeSessionId = managedAiRuntime && taskSessionDecodedParams?.paperclipAiCredentialIdentity !== managedAiRuntime.identity ? null : readNonEmptyString(
+          const taskNativeSessionId = !taskSessionCredentialCompatible ? null : readNonEmptyString(
             taskSessionDecodedParams?.sessionId,
           );
           // Compatibility for native retry rows created before same-run restart

@@ -19,7 +19,12 @@ import {
 } from "@paperclipai/shared";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { prepareManagedAiRuntime } from "../services/ai-connection-runtime.js";
-import { buildEffectiveRunSessionConfigMetadata } from "../services/heartbeat.js";
+import {
+  buildEffectiveRunSessionConfigMetadata,
+  describeTaskSessionCredentialMismatch,
+  isTaskSessionCredentialCompatible,
+} from "../services/heartbeat.js";
+import { sessionCodec as claudeSessionCodec } from "@paperclipai/adapter-claude-local/server";
 import {
   anthropicCompatibleRuntimeEnv,
   discoverAnthropicCompatibleModels,
@@ -168,6 +173,42 @@ describe("session resume across managed runs (L0013, upstream #13699)", () => {
       // The pre-fix behaviour: the per-run home alone changed "adapter config" on every run.
       expect((await meta(a, false)).categoryFingerprints.adapterConfig).not.toBe((await meta(b, false)).categoryFingerprints.adapterConfig);
     } finally { await a.cleanup(); await b.cleanup(); }
+  });
+
+  it("L0013b: the managed credential identity is stable across runs and survives the claude_local codec", async () => {
+    const service = aiConnectionService(db);
+    const saved = await service.save(companyId, owner, { provider: "anthropic_compatible", method: "api_key", name: "Identity check", ownership: "shared", apiKey: KEY, agentIds: [agentId], allAgents: false, endpoint }, KEY);
+    const binding = { provider: "anthropic_compatible", method: "api_key", mode: "shared", connectionId: saved.connectionId, grantId: saved.grantId } as const;
+    const input = { companyId, agentId, responsibleUserId: owner, adapterType: "claude_local", binding, config: { model: "MiniMax-M3", env: {} } };
+    const [a, b] = [await prepareManagedAiRuntime(db, input), await prepareManagedAiRuntime(db, input)];
+    try {
+      // Not per-run volatile: same grant, same responsible user, same secret → same identity.
+      expect(a.identity).toBe(b.identity);
+      // What run 1 stores (server metadata attached to the adapter's params).
+      const stored = { sessionId: randomUUID(), cwd: "/w", paperclipAiCredentialIdentity: a.identity };
+      // The live bug: the adapter codec drops the key, so comparing decoded params always failed.
+      expect((claudeSessionCodec.deserialize(stored) as Record<string, unknown>).paperclipAiCredentialIdentity).toBeUndefined();
+      expect(isTaskSessionCredentialCompatible(stored, b.identity)).toBe(true);
+      expect(describeTaskSessionCredentialMismatch(stored, b.identity)).toBeNull();
+    } finally { await a.cleanup(); await b.cleanup(); }
+  });
+});
+
+describe("isTaskSessionCredentialCompatible (L0013b, upstream #13710)", () => {
+  it.each([
+    [undefined, /no managed AI credential identity/],
+    [null, /no managed AI credential identity/],
+    [{}, /no managed AI credential identity/],
+    [{ paperclipAiCredentialIdentity: "other-grant:user:generation" }, /AI connection grant$/],
+    [{ paperclipAiCredentialIdentity: "grant:other-user:generation" }, /responsible user$/],
+    [{ paperclipAiCredentialIdentity: "grant:user:new-generation" }, /credential generation/],
+  ])("still resets on a real credential change and says why: %j", (saved, reason) => {
+    expect(isTaskSessionCredentialCompatible(saved, "grant:user:generation")).toBe(false);
+    expect(describeTaskSessionCredentialMismatch(saved, "grant:user:generation")).toMatch(reason);
+  });
+
+  it("preserves unmanaged session behavior", () => {
+    expect(isTaskSessionCredentialCompatible({ sessionId: "thread-1" }, undefined)).toBe(true);
   });
 });
 
