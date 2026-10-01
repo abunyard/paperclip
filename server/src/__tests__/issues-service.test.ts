@@ -3078,6 +3078,67 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  describe("child issue workspace under an isolated project policy (wabnet L0015)", () => {
+    async function setupParent(policy: Record<string, unknown> | null) {
+      const companyId = randomUUID();
+      const projectId = randomUUID();
+      const parentIssueId = randomUUID();
+      const projectWorkspaceId = randomUUID();
+      const executionWorkspaceId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+      await db.insert(projects).values({ id: projectId, companyId, name: "Workspace project", status: "in_progress", executionWorkspacePolicy: policy });
+      await db.insert(projectWorkspaces).values({ id: projectWorkspaceId, companyId, projectId, name: "Primary workspace", isPrimary: true, sharedWorkspaceKey: "workspace-key" });
+      await db.insert(executionWorkspaces).values({
+        id: executionWorkspaceId, companyId, projectId, projectWorkspaceId, mode: "isolated_workspace", strategyType: "git_worktree",
+        name: "Parent worktree", status: "active", providerType: "git_worktree", providerRef: `/tmp/${executionWorkspaceId}`, branchName: "WAB-173-parent",
+      });
+      await db.insert(issues).values({
+        id: parentIssueId, companyId, projectId, projectWorkspaceId, title: "Parent issue", status: "in_progress", priority: "medium",
+        executionWorkspaceId, executionWorkspacePreference: "reuse_existing", executionWorkspaceSettings: { mode: "isolated_workspace" },
+      });
+      return { companyId, projectId, parentIssueId, projectWorkspaceId, executionWorkspaceId };
+    }
+    const isolatedPolicy = {
+      enabled: true,
+      defaultMode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}-{{slug}}", provisionCommand: "pnpm install" },
+    };
+
+    it("gives a child its own worktree based on the parent's branch", async () => {
+      const f = await setupParent(isolatedPolicy);
+      const child = await svc.create(f.companyId, { parentId: f.parentIssueId, projectId: f.projectId, title: "Child issue" });
+      expect(child.executionWorkspaceId).toBeNull();
+      expect(child.executionWorkspacePreference).toBeNull();
+      expect(child.projectWorkspaceId).toBe(f.projectWorkspaceId);
+      expect(child.executionWorkspaceSettings).toEqual({
+        mode: "isolated_workspace",
+        workspaceStrategy: { ...isolatedPolicy.workspaceStrategy, baseRef: "refs/heads/WAB-173-parent" },
+      });
+    });
+
+    it("keeps upstream sharing for a shared-workspace project", async () => {
+      const f = await setupParent({ enabled: true, defaultMode: "shared_workspace" });
+      const child = await svc.create(f.companyId, { parentId: f.parentIssueId, projectId: f.projectId, title: "Child issue" });
+      expect(child.executionWorkspaceId).toBe(f.executionWorkspaceId);
+      expect(child.executionWorkspacePreference).toBe("reuse_existing");
+    });
+
+    it("shares the parent's workspace when the create explicitly asks to", async () => {
+      const f = await setupParent(isolatedPolicy);
+      const inherit = await svc.create(f.companyId, { parentId: f.parentIssueId, projectId: f.projectId, title: "Inherit", executionWorkspacePreference: "inherit" });
+      expect(inherit.executionWorkspaceId).toBe(f.executionWorkspaceId);
+      expect(inherit.executionWorkspacePreference).toBe("reuse_existing");
+      const byId = await svc.create(f.companyId, { parentId: f.parentIssueId, projectId: f.projectId, title: "By id", executionWorkspaceId: f.executionWorkspaceId, executionWorkspacePreference: "reuse_existing" });
+      expect(byId.executionWorkspaceId).toBe(f.executionWorkspaceId);
+    });
+  });
+
   it("inherits responsible user for agent-created child issues", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

@@ -106,6 +106,7 @@ import {
 } from "./successful-run-handoff-state.js";
 import {
   defaultIssueExecutionWorkspaceSettingsForProject,
+  applyDefaultIsolatedExecutionWorkspacePolicy,
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
@@ -9652,9 +9653,11 @@ export function issueService(db: Db) {
         onDeduplicated,
         ...issueData
       } = data;
-      const isolatedWorkspacesEnabled = (
-        await instanceSettings.getExperimental()
-      ).enableIsolatedWorkspaces;
+      const experimentalSettings = await instanceSettings.getExperimental();
+      const isolatedWorkspacesEnabled = experimentalSettings.enableIsolatedWorkspaces;
+      // wabnet L0015: the same effective-policy inputs the heartbeat resolver uses.
+      const defaultIsolatedWorkspacesEnabled =
+        isolatedWorkspacesEnabled && experimentalSettings.enableIsolatedWorkspacesByDefault === true;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
         delete issueData.executionWorkspacePreference;
@@ -9795,10 +9798,19 @@ export function issueService(db: Db) {
           : (inheritExecutionWorkspaceFromIssueId ??
             issueData.parentId ??
             null);
+        // wabnet L0015: an explicit request to share the parent's workspace ("inherit" or
+        // "reuse_existing" without naming a workspace id) keeps the upstream sharing path.
+        const explicitShareRequested =
+          issueData.executionWorkspaceId == null &&
+          (issueData.executionWorkspacePreference === "inherit" ||
+            issueData.executionWorkspacePreference === "reuse_existing" ||
+            (issueData.executionWorkspaceSettings as { mode?: unknown } | null | undefined)?.mode === "inherit" ||
+            (issueData.executionWorkspaceSettings as { mode?: unknown } | null | undefined)?.mode === "reuse_existing");
         const hasExplicitExecutionWorkspaceOverride =
-          issueData.executionWorkspaceId !== undefined ||
-          issueData.executionWorkspacePreference !== undefined ||
-          issueData.executionWorkspaceSettings !== undefined;
+          !explicitShareRequested &&
+          (issueData.executionWorkspaceId !== undefined ||
+            issueData.executionWorkspacePreference !== undefined ||
+            issueData.executionWorkspaceSettings !== undefined);
         if (workspaceInheritanceIssueId) {
           const workspaceSource = await getWorkspaceInheritanceIssue(
             tx,
@@ -9834,6 +9846,7 @@ export function issueService(db: Db) {
               .select({
                 id: executionWorkspaces.id,
                 mode: executionWorkspaces.mode,
+                branchName: executionWorkspaces.branchName,
               })
               .from(executionWorkspaces)
               .where(
@@ -9843,7 +9856,45 @@ export function issueService(db: Db) {
                 ),
               )
               .then((rows) => rows[0] ?? null);
-            if (sourceWorkspace) {
+            // wabnet L0015: a CHILD issue in a project whose policy defaults to isolated
+            // workspaces gets its own worktree instead of sharing the parent's worktree and
+            // branch (sharing let sibling sub-tasks commit onto each other's branches). The new
+            // branch is based on the parent's local branch (refs/heads/…, so the parent's
+            // committed but unpushed work is included), resolved when the child's workspace is
+            // realized. Shared-workspace projects and explicit share requests keep upstream sharing.
+            const childPolicy =
+              sourceWorkspace &&
+              !explicitShareRequested &&
+              issueData.parentId != null &&
+              workspaceInheritanceIssueId === issueData.parentId &&
+              issueData.projectId
+                ? applyDefaultIsolatedExecutionWorkspacePolicy({
+                    projectPolicy: gateProjectExecutionWorkspacePolicy(
+                      parseProjectExecutionWorkspacePolicy(
+                        await tx
+                          .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
+                          .from(projects)
+                          .where(and(eq(projects.id, issueData.projectId), eq(projects.companyId, companyId)))
+                          .then((rows) => rows[0]?.executionWorkspacePolicy ?? null),
+                      ),
+                      isolatedWorkspacesEnabled,
+                    ),
+                    defaultIsolatedWorkspacesEnabled,
+                    hasProject: true,
+                  })
+                : null;
+            if (sourceWorkspace && childPolicy?.enabled && childPolicy.defaultMode === "isolated_workspace") {
+              const parentBranch = sourceWorkspace.branchName?.trim();
+              executionWorkspaceId = null;
+              executionWorkspacePreference = null;
+              executionWorkspaceSettings = {
+                mode: "isolated_workspace",
+                workspaceStrategy: {
+                  ...((childPolicy.workspaceStrategy as Record<string, unknown> | undefined) ?? { type: "git_worktree" }),
+                  ...(parentBranch ? { baseRef: `refs/heads/${parentBranch}` } : {}),
+                },
+              };
+            } else if (sourceWorkspace) {
               executionWorkspaceId = sourceWorkspace.id;
               executionWorkspacePreference = "reuse_existing";
               executionWorkspaceSettings = {

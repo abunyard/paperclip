@@ -9958,3 +9958,33 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
     });
   });
 });
+
+describe("child worktree based on the parent's local branch (wabnet L0015)", () => {
+  it("bases the child branch on refs/heads/<parent branch>, including the parent's unpushed commits", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    await runGit(repoRoot, ["checkout", "-B", "PAP-1-parent"]);
+    await fs.writeFile(path.join(repoRoot, "pushed.txt"), "pushed\n", "utf8");
+    await runGit(repoRoot, ["add", "pushed.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "parent pushed"]);
+    await runGit(repoRoot, ["push", "origin", "PAP-1-parent"]);
+    await fs.writeFile(path.join(repoRoot, "unpushed.txt"), "unpushed\n", "utf8");
+    await runGit(repoRoot, ["add", "unpushed.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "parent unpushed"]);
+    await runGit(repoRoot, ["checkout", "master"]);
+
+    const realize = (baseRef: string, identifier: string) => realizeExecutionWorkspace({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "HEAD" },
+      config: { workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}-{{slug}}", baseRef } },
+      issue: { id: `issue-${identifier}`, identifier, title: "Child task" },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+    });
+
+    const child = await realize("refs/heads/PAP-1-parent", "PAP-2");
+    expect(child.branchName).toBe("PAP-2-child-task");
+    await expect(fs.readFile(path.join(child.cwd, "unpushed.txt"), "utf8")).resolves.toBe("unpushed\n");
+    // Why refs/heads: a bare local branch name is mapped to origin/<branch> and drops unpushed work.
+    const viaRemote = await realize("PAP-1-parent", "PAP-3");
+    await expect(fs.readFile(path.join(viaRemote.cwd, "pushed.txt"), "utf8")).resolves.toBe("pushed\n");
+    await expect(fs.readFile(path.join(viaRemote.cwd, "unpushed.txt"), "utf8")).rejects.toThrow();
+  }, 60_000);
+});
