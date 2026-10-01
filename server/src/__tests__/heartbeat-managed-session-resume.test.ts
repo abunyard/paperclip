@@ -250,4 +250,71 @@ describeEmbeddedPostgres("managed AI session resume (wabnet L0013b)", () => {
     });
     await rm(repoRoot, { recursive: true, force: true });
   }, 120_000);
+
+  async function isolatedProjectIssue(issueSettings: Record<string, unknown> | null) {
+    const f = await setup();
+    const repoRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-managed-resume-repo-"));
+    const git = (args: string[]) => execFileAsync("git", args, { cwd: repoRoot });
+    await git(["init"]);
+    await git(["checkout", "-B", "master"]);
+    await git(["config", "user.email", "t@example.com"]);
+    await git(["config", "user.name", "T"]);
+    await writeFile(path.join(repoRoot, "README.md"), "x\n");
+    await git(["add", "README.md"]);
+    await git(["commit", "-m", "init"]);
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    const projectId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId, companyId: f.companyId, name: "Isolated", status: "active",
+      executionWorkspacePolicy: { enabled: true, defaultMode: "isolated_workspace", workspaceStrategy: { type: "git_worktree" } },
+    });
+    await db.insert(projectWorkspaces).values({ id: randomUUID(), companyId: f.companyId, projectId, name: "Primary", cwd: repoRoot, isPrimary: true });
+    await db.update(issues).set({ projectId, identifier: `MR-${Math.floor(Math.random() * 1e6)}`, executionWorkspaceSettings: issueSettings }).where(eq(issues.id, f.issueId));
+    return { ...f, repoRoot };
+  }
+
+  it("L0013e: a pre-policy issue (no persisted workspace settings) resumes after run 1 binds its first workspace", async () => {
+    const f = await isolatedProjectIssue(null);
+    try {
+      const sid = randomUUID();
+      adapterExecute.mockClear();
+      nextResult(sid);
+      await runOnce(f.agentId, f.issueId, { reason: "issue_assigned", source: "assignment" });
+      await storedSession(f.agentId);
+      const [bound] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      expect(bound?.executionWorkspaceSettings).toEqual({ mode: "isolated_workspace" }); // materialized by run 1
+
+      adapterExecute.mockClear();
+      nextResult(sid);
+      const run2 = await runOnce(f.agentId, f.issueId);
+      const input = adapterExecute.mock.calls[0]?.[0] as { runtime: { sessionId: string | null } };
+      expect(input.runtime.sessionId).toBe(sid);
+      expect(await runLog(run2)).not.toContain("Skipping saved session resume");
+    } finally {
+      await rm(f.repoRoot, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it("L0013e: a real change to existing workspace settings still resets the session", async () => {
+    const f = await isolatedProjectIssue({ mode: "isolated_workspace" });
+    try {
+      const sid = randomUUID();
+      adapterExecute.mockClear();
+      nextResult(sid);
+      await runOnce(f.agentId, f.issueId, { reason: "issue_assigned", source: "assignment" });
+      await storedSession(f.agentId);
+      await db.update(issues).set({
+        executionWorkspaceSettings: { mode: "isolated_workspace", workspaceRuntime: { profile: "changed" } },
+      }).where(eq(issues.id, f.issueId));
+
+      adapterExecute.mockClear();
+      nextResult(randomUUID());
+      const run2 = await runOnce(f.agentId, f.issueId);
+      const input = adapterExecute.mock.calls[0]?.[0] as { runtime: { sessionId: string | null } };
+      expect(input.runtime.sessionId).toBeNull();
+      expect(await runLog(run2)).toContain("workspace config");
+    } finally {
+      await rm(f.repoRoot, { recursive: true, force: true });
+    }
+  }, 120_000);
 });

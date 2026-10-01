@@ -6446,6 +6446,20 @@ function buildSessionConfigCategoryValues(input: {
   // boundary; the reusable row and its evolving generation are state.
   delete workspaceConfig.existingExecutionWorkspace;
   delete workspaceConfig.reusableExecutionWorkspaceConfig;
+  // wabnet L0013e: an issue with NO persisted execution-workspace settings (e.g. created before its
+  // project had a policy) gets `{ mode: <realized mode> }` written when run 1 binds its first workspace.
+  // That materialization is not a configuration change. Fingerprint missing settings as the settings
+  // the first bind will write, so run 1 (null) and run 2 ({mode}) compare equal. Any other value,
+  // or a later change to existing settings, is still fingerprinted as-is and still resets.
+  const issueSettings = parseObject(workspaceConfig.issueSettings);
+  const effectiveMode = readNonEmptyString(workspaceConfig.effectiveMode);
+  if (
+    Object.keys(issueSettings).length === 0 &&
+    effectiveMode &&
+    ["isolated_workspace", "shared_workspace", "operator_branch", "agent_default"].includes(effectiveMode)
+  ) {
+    workspaceConfig.issueSettings = { mode: effectiveMode };
+  }
   return {
     adapter: {
       adapterType: input.adapterType,
