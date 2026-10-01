@@ -43,6 +43,7 @@ import {
   stripConfiguredModelFromSessionParams,
   stripPaperclipSessionMetadataFromSessionParams,
   normalizeSessionParams,
+  preferTaskSessionParamsForExplicitResume,
   shouldResetTaskSessionForWake,
   scrubGitCredentialText,
   buildAnchorFallbackWorkspaceNotes,
@@ -3170,5 +3171,22 @@ describe("reconcileReusedExecutionWorkspaceProjectWorkspaceId", () => {
     expect(
       reconcileReusedExecutionWorkspaceProjectWorkspaceId(undefined, "resolved-workspace"),
     ).toBe("resolved-workspace");
+  });
+});
+
+describe("preferTaskSessionParamsForExplicitResume (wabnet L0013d)", () => {
+  const full = { sessionId: "s-1", cwd: "/wt/WAB-191", promptBundleKey: "b", mcpServerIdentity: "[]" };
+  it("fills a session-id-only explicit resume from the task session of the same session", () => {
+    expect(preferTaskSessionParamsForExplicitResume({ explicitParams: { sessionId: "s-1" }, taskSessionParams: full })).toEqual(full);
+  });
+  it("keeps explicit values on conflict and ignores a task session for a different session", () => {
+    expect(preferTaskSessionParamsForExplicitResume({ explicitParams: { sessionId: "s-1", cwd: "/other" }, taskSessionParams: full }))
+      .toEqual({ ...full, cwd: "/other" });
+    expect(preferTaskSessionParamsForExplicitResume({ explicitParams: { sessionId: "s-2" }, taskSessionParams: full }))
+      .toEqual({ sessionId: "s-2" });
+  });
+  it("falls back to the task session without an explicit resume", () => {
+    expect(preferTaskSessionParamsForExplicitResume({ explicitParams: null, taskSessionParams: full })).toEqual(full);
+    expect(preferTaskSessionParamsForExplicitResume({ explicitParams: null, taskSessionParams: null })).toBeNull();
   });
 });

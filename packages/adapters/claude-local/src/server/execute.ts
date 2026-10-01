@@ -849,7 +849,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       "stdout",
       `[paperclip] Claude session "${runtimeSessionId}" does not match the current remote execution identity and will not be resumed in "${effectiveExecutionCwd}". Starting a fresh remote session.\n`,
     );
-  } else if (runtimeSessionId && isValidUuid && !canResumeSession) {
+  } else if (
+    runtimeSessionId &&
+    isValidUuid &&
+    !canResumeSession &&
+    // wabnet L0013d: only blame the cwd when the cwd is the reason. This branch used to fire for any
+    // refusal (e.g. a missing MCP server identity) and printed a misleading `saved for cwd ""`.
+    !claudeSessionCwdMatchesExecutionTarget({ runtimeSessionCwd, effectiveExecutionCwd, executionTargetIsRemote })
+  ) {
     await onLog(
       "stdout",
       `[paperclip] Claude session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
@@ -864,7 +871,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (runtimeSessionId && !hasMatchingMcpServers) {
     await onLog(
       "stdout",
-      `[paperclip] Claude session "${runtimeSessionId}" was saved with a different runtime MCP server set and will not be resumed.\n`,
+      runtimeMcpServerIdentity.length === 0
+        ? `[paperclip] Claude session "${runtimeSessionId}" was saved without a runtime MCP server identity (this run has ${runtimeMcpServers.length} runtime MCP server(s)) and will not be resumed.\n`
+        : `[paperclip] Claude session "${runtimeSessionId}" was saved with a different runtime MCP server set and will not be resumed.\n`,
     );
   }
   const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");

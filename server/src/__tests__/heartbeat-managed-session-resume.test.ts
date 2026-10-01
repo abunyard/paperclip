@@ -3,7 +3,9 @@
 // starts fresh with a logged reason. Before L0013b the identity check read the codec-decoded
 // params, which never carry the identity, so run 2 always received sessionId null silently.
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
 import { eq } from "drizzle-orm";
@@ -15,6 +17,8 @@ import {
   companyMemberships,
   createDb,
   issues,
+  projects,
+  projectWorkspaces,
 } from "@paperclipai/db";
 import { sessionCodec as claudeSessionCodec } from "@paperclipai/adapter-claude-local/server";
 import { anthropicCompatibleEndpointSchema } from "@paperclipai/shared";
@@ -38,6 +42,8 @@ vi.mock("../adapters/index.js", async () => {
 
 const { heartbeatService } = await import("../services/heartbeat.js");
 const { aiConnectionService } = await import("../services/ai-connections.js");
+const { instanceSettingsService } = await import("../services/instance-settings.js");
+const execFileAsync = promisify(execFile);
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -93,14 +99,19 @@ describeEmbeddedPostgres("managed AI session resume (wabnet L0013b)", () => {
     return { companyId, agentId, issueId, saved, service };
   }
 
-  async function runOnce(agentId: string, issueId: string) {
+  async function runOnce(
+    agentId: string,
+    issueId: string,
+    wake: { reason?: string; source?: "on_demand" | "automation" | "assignment"; context?: Record<string, unknown> } = {},
+  ) {
     const heartbeat = heartbeatService(db);
+    const reason = wake.reason ?? "issue_commented";
     const run = await heartbeat.wakeup(agentId, {
-      source: "on_demand",
-      triggerDetail: "manual",
-      reason: "issue_commented",
+      source: wake.source ?? "on_demand",
+      triggerDetail: wake.source === "automation" ? "system" : "manual",
+      reason,
       payload: { issueId },
-      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_commented" },
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: reason, ...(wake.context ?? {}) },
     });
     expect(run).not.toBeNull();
     await vi.waitFor(async () => {
@@ -126,12 +137,19 @@ describeEmbeddedPostgres("managed AI session resume (wabnet L0013b)", () => {
     return row!;
   }
 
+  const MCP_IDENTITY = JSON.stringify([{ name: "paperclip", url: "http://127.0.0.1:3100/mcp", connectionId: null }]);
   function nextResult(sessionId: string) {
     adapterExecute.mockImplementationOnce(async (ctx: { config: Record<string, unknown>; context: Record<string, unknown> }) => ({
       exitCode: 0,
       signal: null,
       timedOut: false,
-      sessionParams: { sessionId, cwd: (ctx.context.paperclipWorkspace as { cwd?: string } | undefined)?.cwd ?? process.cwd() },
+      // Shaped like the real claude_local result (cwd, prompt bundle and MCP server identity).
+      sessionParams: {
+        sessionId,
+        cwd: (ctx.context.paperclipWorkspace as { cwd?: string } | undefined)?.cwd ?? process.cwd(),
+        promptBundleKey: "bundle-1",
+        mcpServerIdentity: MCP_IDENTITY,
+      },
       sessionDisplayId: sessionId,
       summary: "ok",
       provider: "anthropic",
@@ -181,4 +199,55 @@ describeEmbeddedPostgres("managed AI session resume (wabnet L0013b)", () => {
     expect(log).not.toContain(KEY);
     expect(companyId).toBeTruthy();
   }, 90_000);
+
+  it("L0013d: hop 1 after an issue_assigned first run in a fresh worktree resumes with the full saved params", async () => {
+    const { agentId, issueId, companyId } = await setup();
+    const repoRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-managed-resume-repo-"));
+    const git = (args: string[]) => execFileAsync("git", args, { cwd: repoRoot });
+    await git(["init"]);
+    await git(["checkout", "-B", "master"]);
+    await git(["config", "user.email", "t@example.com"]);
+    await git(["config", "user.name", "T"]);
+    await writeFile(path.join(repoRoot, "README.md"), "x\n");
+    await git(["add", "README.md"]);
+    await git(["commit", "-m", "init"]);
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    const projectId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId, companyId, name: "Isolated", status: "active",
+      executionWorkspacePolicy: { enabled: true, defaultMode: "isolated_workspace", workspaceStrategy: { type: "git_worktree" } },
+    });
+    await db.insert(projectWorkspaces).values({ id: randomUUID(), companyId, projectId, name: "Primary", cwd: repoRoot, isPrimary: true });
+    // As issueService.create persists it for a project with an isolated policy.
+    await db.update(issues).set({ projectId, identifier: "MR-1", executionWorkspaceSettings: { mode: "isolated_workspace" } }).where(eq(issues.id, issueId));
+
+    const sid = randomUUID();
+    adapterExecute.mockClear();
+    nextResult(sid);
+    await runOnce(agentId, issueId, { reason: "issue_assigned", source: "assignment" });
+    const run1Input = adapterExecute.mock.calls[0]?.[0] as { runtime: { sessionId: string | null }; context: Record<string, unknown> };
+    expect(run1Input.runtime.sessionId).toBeNull();
+    const run1Cwd = (run1Input.context.paperclipWorkspace as { cwd: string }).cwd;
+    expect(path.resolve(run1Cwd)).not.toBe(path.resolve(repoRoot)); // a fresh worktree, not the checkout
+    await storedSession(agentId);
+
+    // The handoff wake was resolved at ENQUEUE time, before run 1's task session existed:
+    // it carries only the session id (the live WAB-191 hop-1 shape).
+    adapterExecute.mockClear();
+    nextResult(sid);
+    await runOnce(agentId, issueId, {
+      reason: "finish_successful_run_handoff",
+      source: "automation",
+      context: { resumeSessionDisplayId: sid, resumeSessionParams: { sessionId: sid } },
+    });
+    const run2Input = adapterExecute.mock.calls[0]?.[0] as { runtime: { sessionId: string | null; sessionParams: Record<string, unknown> | null } };
+    expect(run2Input.runtime.sessionId).toBe(sid);
+    expect(run2Input.runtime.sessionParams).toMatchObject({
+      sessionId: sid,
+      cwd: run1Cwd,
+      promptBundleKey: "bundle-1",
+      mcpServerIdentity: MCP_IDENTITY,
+    });
+    await rm(repoRoot, { recursive: true, force: true });
+  }, 120_000);
 });

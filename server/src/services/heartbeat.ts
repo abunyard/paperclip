@@ -5247,6 +5247,31 @@ type ResumeSessionRow = {
   lastRunId: string | null;
 };
 
+/**
+ * wabnet L0013d: an explicit resume (e.g. a finish_successful_run_handoff wake) is resolved when the
+ * wake is ENQUEUED. For a task's first run that is before the run's task session row exists, so the
+ * override carries only `{ sessionId }`: no cwd, prompt bundle or MCP server identity. claude_local
+ * then refuses to resume ("saved with a different runtime MCP server set"; its log blames cwd "").
+ * At execution time the task session row exists. When it holds the SAME session, use its full
+ * params, with explicit values winning on conflict. A different session id keeps the explicit params.
+ */
+export function preferTaskSessionParamsForExplicitResume(input: {
+  explicitParams: Record<string, unknown> | null;
+  taskSessionParams: Record<string, unknown> | null;
+}): Record<string, unknown> | null {
+  const { explicitParams, taskSessionParams } = input;
+  if (!explicitParams) return taskSessionParams;
+  const explicitSessionId = readNonEmptyString(explicitParams.sessionId);
+  if (
+    taskSessionParams &&
+    explicitSessionId &&
+    readNonEmptyString(taskSessionParams.sessionId) === explicitSessionId
+  ) {
+    return { ...taskSessionParams, ...explicitParams };
+  }
+  return explicitParams;
+}
+
 export function buildExplicitResumeSessionOverride(input: {
   adapterType?: string | null;
   resumeFromRunId: string;
@@ -21130,22 +21155,25 @@ export function heartbeatService(
       const sessionResetReason =
         sessionConfigFreshness.reasons.join("; ") || null;
       const taskSessionForRun = resetTaskSession ? null : taskSession;
-      const previousSessionParams =
-        explicitResumeSessionParams ??
-        (isCanonicalSessionIdForAdapter(
-          agent.adapterType,
-          explicitResumeSessionDisplayId,
-        )
-          ? { sessionId: explicitResumeSessionDisplayId }
-          : null) ??
-        normalizeResumeParamsForAdapter(
-          agent.adapterType,
-          stripPaperclipSessionMetadataFromSessionParams(
-            sessionCodec.deserialize(
-              taskSessionForRun?.sessionParamsJson ?? null,
-            ),
+      const taskSessionResumeParams = normalizeResumeParamsForAdapter(
+        agent.adapterType,
+        stripPaperclipSessionMetadataFromSessionParams(
+          sessionCodec.deserialize(
+            taskSessionForRun?.sessionParamsJson ?? null,
           ),
-        );
+        ),
+      );
+      const previousSessionParams = preferTaskSessionParamsForExplicitResume({
+        explicitParams:
+          explicitResumeSessionParams ??
+          (isCanonicalSessionIdForAdapter(
+            agent.adapterType,
+            explicitResumeSessionDisplayId,
+          )
+            ? { sessionId: explicitResumeSessionDisplayId }
+            : null),
+        taskSessionParams: taskSessionResumeParams,
+      });
       const {
         selectedEnvironmentDriver: lowTrustPreflightEnvironmentDriver,
         workspace: resolvedWorkspace,
