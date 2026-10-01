@@ -234,6 +234,39 @@ export function decideClaudeAuthMerge(refreshed: string, current: string): numbe
   return 10;
 }
 
+// Port of upstream 2a99de80e (#13699), session-fingerprint part only (wabnet L0013).
+function managedAiHomeEnvironment(home: string): Record<string, string> {
+  const providerHome = path.join(home, "provider");
+  return {
+    HOME: home,
+    XDG_CONFIG_HOME: path.join(home, "config"),
+    XDG_DATA_HOME: path.join(home, "data"),
+    CODEX_HOME: providerHome,
+    GROK_HOME: providerHome,
+    CLAUDE_CONFIG_DIR: providerHome,
+  };
+}
+
+/**
+ * Only the server-created credential home is volatile; retain all other config.
+ * Each managed run gets a fresh mkdtemp home, so without this the session
+ * fingerprint changed on EVERY run and saved sessions were never resumed
+ * ("effective run configuration changed: adapter config"). Only exact matches
+ * of the run's own home paths are normalized; the execution env is unchanged.
+ */
+export function managedAiSessionFingerprintConfig(
+  config: Record<string, unknown>,
+  managedHome: string | undefined,
+): Record<string, unknown> {
+  if (!managedHome) return config;
+  const env = { ...(config.env as Record<string, unknown> | undefined) };
+  const stable = managedAiHomeEnvironment("<managed-ai-home>");
+  for (const [key, value] of Object.entries(managedAiHomeEnvironment(managedHome))) {
+    if (env[key] === value) env[key] = stable[key];
+  }
+  return { ...config, env };
+}
+
 export async function prepareManagedAiRuntime(
   db: Db,
   input: {
@@ -379,6 +412,7 @@ export async function prepareManagedAiRuntime(
       accountName: selection.connection.name,
       accountOwnerUserId: selection.grant.subjectUserId,
       identity,
+      home,
       cleanup: async () => {
         try {
           if (subscriptionFile) {

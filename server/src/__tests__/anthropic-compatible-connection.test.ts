@@ -19,6 +19,7 @@ import {
 } from "@paperclipai/shared";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { prepareManagedAiRuntime } from "../services/ai-connection-runtime.js";
+import { buildEffectiveRunSessionConfigMetadata } from "../services/heartbeat.js";
 import {
   anthropicCompatibleRuntimeEnv,
   discoverAnthropicCompatibleModels,
@@ -146,6 +147,27 @@ describe("runtime env", () => {
     expect(JSON.stringify(await service.list(companyId, owner))).not.toContain(KEY);
     const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, saved.connectionId));
     expect(JSON.stringify(row.config)).not.toContain(KEY);
+  });
+});
+
+describe("session resume across managed runs (L0013, upstream #13699)", () => {
+  it("keeps the session fingerprint across two runs whose managed homes differ", async () => {
+    const service = aiConnectionService(db);
+    const saved = await service.save(companyId, owner, { provider: "anthropic_compatible", method: "api_key", name: "Resume check", ownership: "shared", apiKey: KEY, agentIds: [agentId], allAgents: false, endpoint }, KEY);
+    const binding = { provider: "anthropic_compatible", method: "api_key", mode: "shared", connectionId: saved.connectionId, grantId: saved.grantId } as const;
+    const input = { companyId, agentId, responsibleUserId: owner, adapterType: "claude_local", binding, config: { model: "MiniMax-M3", env: { KEEP: "1" } } };
+    const [a, b] = [await prepareManagedAiRuntime(db, input), await prepareManagedAiRuntime(db, input)];
+    try {
+      expect((a.config.env as Record<string, string>).HOME).not.toBe((b.config.env as Record<string, string>).HOME);
+      const meta = (run: typeof a, withHome: boolean) => buildEffectiveRunSessionConfigMetadata({
+        adapterType: "claude_local", effectiveAdapterConfig: run.config, agentRuntimeConfig: {}, issueOverrides: null,
+        workspaceConfig: {}, environment: null, environmentEnv: {}, projectEnv: {}, routineEnv: {}, runtimeSkills: [],
+        ...(withHome ? { managedAiHome: run.home } : {}),
+      });
+      expect((await meta(a, true)).fingerprint).toBe((await meta(b, true)).fingerprint);
+      // The pre-fix behaviour: the per-run home alone changed "adapter config" on every run.
+      expect((await meta(a, false)).categoryFingerprints.adapterConfig).not.toBe((await meta(b, false)).categoryFingerprints.adapterConfig);
+    } finally { await a.cleanup(); await b.cleanup(); }
   });
 });
 

@@ -8,7 +8,7 @@ import { hasRemoteTerminationReceipt, remoteExecutionHasStopped, remoteTerminati
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "./connector-runtime.js";
 import { admitExplicitNativeContinuation, undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
 import { connectionIntentService } from "./connection-intents.js";
-import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
+import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
 import { localConfinementViolation, resolveLocalConfinementPolicy } from "./local-confinement-policy.js";
 import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
@@ -6451,6 +6451,8 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
   secretManifest?: readonly EffectiveRunConfigSecretManifestEntry[];
   runtimeSkills: unknown;
   agentConfigRevision?: unknown;
+  /** wabnet L0013 (upstream #13699): the managed AI runtime's per-run home. */
+  managedAiHome?: string;
 }): Promise<EffectiveRunSessionConfigMetadata> {
   const secretManifest = input.secretManifest ?? [];
   const instructions = await resolveInstructionsConfigFingerprintMetadata(
@@ -6458,7 +6460,7 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
   );
   const categoryValues = buildSessionConfigCategoryValues({
     adapterType: input.adapterType,
-    effectiveAdapterConfig: input.effectiveAdapterConfig,
+    effectiveAdapterConfig: managedAiSessionFingerprintConfig(input.effectiveAdapterConfig, input.managedAiHome),
     agentRuntimeConfig: input.agentRuntimeConfig,
     instructions,
     issueOverrides: input.issueOverrides,
@@ -21012,6 +21014,7 @@ export function heartbeatService(
         await buildEffectiveRunSessionConfigMetadata({
           adapterType: agent.adapterType,
           effectiveAdapterConfig: runtimeConfig,
+          managedAiHome: managedAiRuntime?.home,
           agentRuntimeConfig: agent.runtimeConfig,
           issueOverrides: issueAssigneeOverrides,
           workspaceConfig: {
