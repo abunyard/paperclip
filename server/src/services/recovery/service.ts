@@ -1839,6 +1839,12 @@ export function recoveryService(
             eq(issueComments.issueId, issueId),
             eq(issueComments.authorAgentId, assigneeAgentId),
             gt(issueComments.createdAt, since),
+            // wabnet L0016 (upstream #14458): the comment Paperclip itself publishes from a run's final
+            // output (the run presentation, recorded as `resultJson.presentationDecision.commentId` on the
+            // run that created it) is not assignee progress. Counting it let every no-op continuation run
+            // exempt the next one, so the 30 s sweep requeued forever. Comments the agent posts itself
+            // (API/tool writes) and attachments still count.
+            sql`not exists (select 1 from heartbeat_runs presentation_run where presentation_run.id = ${issueComments.createdByRunId} and presentation_run.result_json -> 'presentationDecision' ->> 'commentId' = ${issueComments.id}::text)`,
           ),
         )
         .limit(1)

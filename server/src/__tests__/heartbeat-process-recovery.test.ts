@@ -15020,6 +15020,159 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.status).toBe("blocked");
   });
 
+  // wabnet L0016 (upstream #14458): the run-summary comment Paperclip publishes from a run's own final
+  // output must not count as assignee progress, or every no-op continuation exempts the next one.
+  async function addPresentationComment(input: {
+    companyId: string;
+    issueId: string;
+    agentId: string;
+    runId: string;
+    body: string;
+  }) {
+    const [comment] = await db
+      .insert(issueComments)
+      .values({
+        companyId: input.companyId,
+        issueId: input.issueId,
+        authorAgentId: input.agentId,
+        createdByRunId: input.runId,
+        body: input.body,
+      })
+      .returning();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: {
+          presentationDecision: { commentAction: "create", commentId: comment!.id },
+        },
+      })
+      .where(eq(heartbeatRuns.id, input.runId));
+    return comment!;
+  }
+
+  it("does not count the run's own presentation comment as recent progress (wabnet L0016, #14458)", async () => {
+    const { companyId, agentId, issueId, runId } =
+      await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "succeeded",
+        retryReason: "issue_continuation_needed",
+        runSource: "issue.productive_terminal_continuation_recovery",
+        livenessState: "needs_followup",
+      });
+    await addPresentationComment({
+      companyId,
+      issueId,
+      agentId,
+      runId,
+      body: "No change. Confirmation still pending.",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.recentProgressExempted).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(1);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+  });
+
+  it("still counts a comment the agent posted itself during the run (wabnet L0016)", async () => {
+    const { companyId, agentId, issueId, runId } =
+      await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "succeeded",
+        retryReason: "issue_continuation_needed",
+        runSource: "issue.productive_terminal_continuation_recovery",
+        livenessState: "advanced",
+      });
+    // An API/tool comment from the same run (not the presentation comment) is real progress.
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      createdByRunId: runId,
+      body: "frame 03/08 generated",
+    });
+    await addPresentationComment({
+      companyId,
+      issueId,
+      agentId,
+      runId,
+      body: "Generated frame 3.",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(0);
+    expect(result.recentProgressExempted).toBe(1);
+    expect(result.continuationRequeued).toBe(1);
+  });
+
+  it("stops the 30 s no-op continuation loop on the first sweep (wabnet L0016, #14458 reproduction)", async () => {
+    const { companyId, agentId, issueId, runId } =
+      await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "succeeded",
+        retryReason: "issue_continuation_needed",
+        runSource: "issue.productive_terminal_continuation_recovery",
+        livenessState: "needs_followup",
+      });
+    const heartbeat = heartbeatService(db);
+    // Each loop iteration mimics one live cycle: the latest run finished with only Paperclip's
+    // run-summary comment, the sweep ticks, and any requeued run "runs" and finishes the same way.
+    let latestRunId = runId;
+    const seenRunIds = new Set<string>([runId]);
+    let requeues = 0;
+    let escalations = 0;
+    for (let tick = 0; tick < 5; tick += 1) {
+      await addPresentationComment({
+        companyId,
+        issueId,
+        agentId,
+        runId: latestRunId,
+        body: `No change (heartbeat ${tick + 1}).`,
+      });
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      requeues += result.continuationRequeued;
+      escalations += result.escalated;
+      if (result.continuationRequeued === 0) break;
+      const next = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId))
+        .then((rows) => rows.find((row) => !seenRunIds.has(row.id)) ?? null);
+      if (!next) break;
+      await db
+        .update(heartbeatRuns)
+        .set({
+          status: "succeeded",
+          livenessState: "needs_followup",
+          startedAt: new Date(),
+          finishedAt: new Date(),
+        })
+        .where(eq(heartbeatRuns.id, next.id));
+      await db
+        .update(issues)
+        .set({ executionRunId: null, checkoutRunId: null })
+        .where(eq(issues.id, issueId));
+      seenRunIds.add(next.id);
+      latestRunId = next.id;
+    }
+    expect(requeues).toBe(0);
+    expect(escalations).toBe(1);
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+  });
+
   it("does not reconcile user-assigned work through the agent stranded-work recovery path", async () => {
     const { issueId, runId } = await seedStrandedIssueFixture({
       status: "todo",
